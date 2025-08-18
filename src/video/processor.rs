@@ -5,9 +5,14 @@ use std::process::Command;
 pub struct VideoProcessor;
 
 impl VideoProcessor {
-    pub fn trim_clip(clip: &Clip, output_path: &Path) -> anyhow::Result<()> {
+    pub fn trim_clip(clip: &Clip, output_path: &Path, force_overwrite: bool) -> anyhow::Result<()> {
         let start_time = format!("{:.3}", clip.trim_start);
         let duration = format!("{:.3}", clip.trim_end - clip.trim_start);
+        
+        // Check if output file exists and prompt if not force overwrite
+        if output_path.exists() && !force_overwrite {
+            return Err(anyhow::anyhow!("Output file exists. Use shift+click to overwrite."));
+        }
         
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-i")
@@ -55,8 +60,10 @@ impl VideoProcessor {
             }
         }
 
-        cmd.arg("-y") // Overwrite output file
-            .arg(output_path);
+        if force_overwrite {
+            cmd.arg("-y"); // Only overwrite when explicitly requested (shift+click)
+        }
+        cmd.arg(output_path);
 
         let output = cmd.output()?;
         

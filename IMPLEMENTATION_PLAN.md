@@ -51,9 +51,10 @@ src/
 
 #### Video Processing
 - FFmpeg command-line integration for trimming
-- Audio track mixing with surround support
+- Audio track mixing with surround support: FL|FR channel mapping allows tracks to be disabled separately while still being audible in mixed output
 - Video info extraction (duration, audio tracks)
 - Thumbnail generation capability
+- Overwrite protection: Normal clicks prompt for confirmation, shift+click overwrites automatically
 
 #### GUI Framework
 - Main application window with egui
@@ -63,9 +64,10 @@ src/
 - File management operations
 
 #### File Management
-- Configuration loading/saving
-- Directory organization (deleted/trimmed folders)
+- Configuration loading/saving with last watched directory restoration
+- Directory organization (deleted/trimmed folders within watched directory)
 - OBS replay file timestamp parsing
+- Startup behavior: Restore last watched directory or wait for user selection if none exists
 
 ## 🚧 NEXT STEPS - Implementation Priority
 
@@ -220,9 +222,10 @@ RUST_LOG=debug cargo run
 ```
 
 ### Testing Strategy
-1. **Unit Tests**: Core data structures and file operations
-2. **Integration Tests**: FFmpeg processing and file management
-3. **Manual Testing**: Hotkeys, GUI interactions, video playback
+1. **Unit Tests**: Core data structures, file operations, timestamp parsing
+2. **Integration Tests**: FFmpeg processing, file management workflows
+3. **Mock Systems**: File monitoring and organization testing without actual files
+4. **Testable Design**: All major functionality designed to be testable without requiring actual video files or global hotkeys
 
 ### Deployment Considerations
 - **FFmpeg**: Bundle or require separate installation

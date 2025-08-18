@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub output_directory: PathBuf,
     pub deleted_directory: PathBuf,
     pub trimmed_directory: PathBuf,
+    pub last_watched_directory: Option<PathBuf>,
     pub ffmpeg_path: Option<PathBuf>,
 }
 
@@ -17,6 +18,7 @@ impl Default for AppConfig {
             output_directory: PathBuf::from("./output"),
             deleted_directory: PathBuf::from("./output/deleted"),
             trimmed_directory: PathBuf::from("./output/trimmed"),
+            last_watched_directory: None,
             ffmpeg_path: None,
         }
     }

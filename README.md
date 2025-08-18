@@ -1,3 +1,5 @@
+⚠️ VIBE CODING EXPERIMENT
+
 # Clip Helper - OBS Replay Buffer Trimmer
 
 A Rust application designed to help streamline the process of trimming and organizing clips from OBS's replay buffer feature.
@@ -27,7 +29,7 @@ A Rust application designed to help streamline the process of trimming and organ
 ### Audio Features
 - Visual audio waveforms for each track
 - Enable/disable individual audio tracks
-- Surround left/right channel mapping option
+- Surround left/right channel mapping option: Maps selected tracks to FL|FR channels so they can be disabled separately while still being audible in the mixed output
 - Mixed output: Track 1 = mixed audio, Track 2+ = original tracks preserved
 
 ## Requirements
@@ -67,6 +69,7 @@ cargo build --release
    - Run the application: `cargo run --release`
    - Configure the OBS replay directory in Settings
    - Set output directories for trimmed and deleted clips
+   - Last watched directory is automatically restored on startup; if none exists, no directory is monitored until user selects one
 
 2. **Capturing Clips**:
    - While OBS is recording with replay buffer enabled
@@ -82,9 +85,10 @@ cargo build --release
 
 4. **File Organization**:
    - Original files remain untouched
-   - Deleted clips move to the "deleted" subfolder
-   - Trimmed clips save to the "trimmed" subfolder
+   - Deleted clips move to the "deleted" subfolder within the watched directory
+   - Trimmed clips save to the "trimmed" subfolder within the watched directory
    - Custom names are appended: "Original Name - Custom Name.mkv"
+   - Normal clicks prompt for confirmation if file exists; shift+click overwrites automatically
 
 ## Project Structure
 
@@ -162,6 +166,12 @@ cargo test
 cargo test test_name
 ```
 
+### Testing Philosophy
+- **Unit Tests**: Core data structures, file operations, timestamp parsing
+- **Integration Tests**: FFmpeg processing, file management workflows  
+- **Mock Systems**: File monitoring and organization testing without actual files
+- **Testable Design**: All major functionality designed to be testable without requiring actual video files or global hotkeys
+
 ### Architecture Notes
 
 - **GUI Framework**: Uses egui for cross-platform native UI
@@ -182,6 +192,7 @@ Example configuration:
   "output_directory": "C:\\Users\\Username\\Videos\\Clips",
   "deleted_directory": "C:\\Users\\Username\\Videos\\Clips\\deleted",
   "trimmed_directory": "C:\\Users\\Username\\Videos\\Clips\\trimmed",
+  "last_watched_directory": "C:\\Users\\Username\\Videos\\OBS Replays",
   "ffmpeg_path": null
 }
 ```

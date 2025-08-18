@@ -81,13 +81,13 @@ impl ClipHelperApp {
         Ok(())
     }
 
-    pub fn apply_trim(&mut self) -> anyhow::Result<()> {
+    pub fn apply_trim(&mut self, force_overwrite: bool) -> anyhow::Result<()> {
         if let Some(index) = self.selected_clip_index {
             if let Some(clip) = self.clips.get_mut(index) {
                 let output_filename = format!("{}.mkv", clip.get_output_filename());
                 let output_path = self.config.trimmed_directory.join(output_filename);
                 
-                crate::video::VideoProcessor::trim_clip(clip, &output_path)?;
+                crate::video::VideoProcessor::trim_clip(clip, &output_path, force_overwrite)?;
                 clip.is_trimmed = true;
             }
         }
@@ -196,7 +196,7 @@ impl ClipHelperApp {
         // Action buttons
         ui.horizontal(|ui| {
             if ui.button("Apply Trim").clicked() {
-                if let Err(e) = self.apply_trim() {
+                if let Err(e) = self.apply_trim(false) {
                     log::error!("Failed to apply trim: {}", e);
                 }
             }
