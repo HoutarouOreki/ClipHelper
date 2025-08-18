@@ -1,0 +1,219 @@
+# Clip Helper - OBS Replay Buffer Trimmer
+
+A Rust application designed to help streamline the process of trimming and organizing clips from OBS's replay buffer feature.
+
+## Features
+
+### Core Functionality
+- **Global Hotkeys**: Capture clips with Ctrl+1-5 for different durations (15s, 30s, 1m, 2m, 5m)
+- **Smart File Matching**: Automatically matches timestamps to replay files within a 10-second window
+- **Timeline Editor**: Visual timeline with scrubbing controls for precise trimming
+- **Video Preview**: Built-in video player with playback controls
+- **Audio Track Management**: Enable/disable tracks and configure surround sound options
+
+### Hotkey Mappings
+- `Ctrl+1` = 15 second clip
+- `Ctrl+2` = 30 second clip  
+- `Ctrl+3` = 1 minute clip
+- `Ctrl+4` = 2 minute clip
+- `Ctrl+5` = 5 minute clip
+
+### Controls
+- **Playback**: Play/pause, seek to start, seek to last 5 seconds
+- **Navigation**: Skip forward/backward by 3s, 5s, 10s
+- **Trimming**: Adjust start/end times by 1s or 5s increments
+- **File Management**: Delete (moves to "deleted" folder), Apply trim (saves to "trimmed" folder)
+
+### Audio Features
+- Visual audio waveforms for each track
+- Enable/disable individual audio tracks
+- Surround left/right channel mapping option
+- Mixed output: Track 1 = mixed audio, Track 2+ = original tracks preserved
+
+## Requirements
+
+### System Dependencies
+- **FFmpeg**: Required for video/audio processing
+  - Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+  - Ensure `ffmpeg` and `ffprobe` are in your system PATH
+- **Rust**: Version 1.70+ required
+- **Windows**: Currently Windows-only due to global hotkey implementation
+
+### OBS Setup
+- Configure OBS replay buffer to save files with format: "Replay YYYY-MM-DD HH-MM-SS.mkv"
+- Set up a dedicated directory for replay buffer files
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd ClipHelper
+```
+
+2. Install Rust dependencies:
+```bash
+cargo build --release
+```
+
+3. Install FFmpeg:
+   - Download FFmpeg from the official website
+   - Extract to a folder (e.g., `C:\ffmpeg`)
+   - Add the `bin` directory to your system PATH
+
+## Usage
+
+1. **Initial Setup**:
+   - Run the application: `cargo run --release`
+   - Configure the OBS replay directory in Settings
+   - Set output directories for trimmed and deleted clips
+
+2. **Capturing Clips**:
+   - While OBS is recording with replay buffer enabled
+   - Press `Ctrl+1` through `Ctrl+5` when something interesting happens
+   - The application will automatically find the matching replay file
+
+3. **Editing Clips**:
+   - Select a clip from the list on the left
+   - Use the timeline to scrub through the video
+   - Adjust start/end times with the trim controls
+   - Configure audio tracks as needed
+   - Click "Apply" to save the trimmed clip
+
+4. **File Organization**:
+   - Original files remain untouched
+   - Deleted clips move to the "deleted" subfolder
+   - Trimmed clips save to the "trimmed" subfolder
+   - Custom names are appended: "Original Name - Custom Name.mkv"
+
+## Project Structure
+
+```
+src/
+├── main.rs              # Application entry point
+├── core/                # Core data structures and logic
+│   ├── mod.rs
+│   ├── clip.rs          # Clip data structure and metadata
+│   ├── config.rs        # Application configuration
+│   └── file_monitor.rs  # File system monitoring
+├── gui/                 # User interface components
+│   ├── mod.rs
+│   ├── app.rs           # Main application window
+│   ├── clip_list.rs     # Clip list sidebar
+│   ├── timeline.rs      # Timeline editor widget
+│   └── controls.rs      # Playback controls
+├── hotkeys/             # Global hotkey management
+│   ├── mod.rs
+│   ├── manager.rs       # Hotkey registration and handling
+│   └── events.rs        # Hotkey event definitions
+└── video/               # Video processing
+    ├── mod.rs
+    ├── processor.rs     # FFmpeg integration for trimming
+    ├── preview.rs       # Video preview functionality
+    └── waveform.rs      # Audio waveform generation
+```
+
+## Implementation Status
+
+### ✅ Completed
+- Project structure and dependencies
+- Core data structures (Clip, Config)
+- Global hotkey system foundation
+- FFmpeg integration for video processing
+- Basic GUI framework setup
+- Audio track management structure
+
+### 🚧 In Progress
+- GUI timeline component with scrubbing
+- Video preview integration
+- Waveform visualization
+- File monitoring for new replay files
+
+### 📋 TODO
+- Settings dialog for configuration
+- Thumbnail generation for clip list
+- Drag-and-drop timeline handles
+- Real-time video preview
+- Batch processing operations
+- Keyboard shortcuts for timeline navigation
+- Export presets and quality settings
+- Plugin system for custom processing
+
+## Development
+
+### Building
+```bash
+# Debug build
+cargo build
+
+# Release build
+cargo build --release
+
+# Run with logging
+RUST_LOG=debug cargo run
+```
+
+### Testing
+```bash
+# Run tests
+cargo test
+
+# Run with specific test
+cargo test test_name
+```
+
+### Architecture Notes
+
+- **GUI Framework**: Uses egui for cross-platform native UI
+- **Video Processing**: FFmpeg via command-line interface for maximum compatibility
+- **Global Hotkeys**: Windows-specific implementation using Win32 APIs
+- **Async Operations**: Tokio runtime for file monitoring and background tasks
+- **Error Handling**: Comprehensive error handling with anyhow and thiserror
+
+## Configuration
+
+The application stores configuration in:
+- Windows: `%APPDATA%\clip-helper\config.json`
+
+Example configuration:
+```json
+{
+  "obs_replay_directory": "C:\\Users\\Username\\Videos\\OBS Replays",
+  "output_directory": "C:\\Users\\Username\\Videos\\Clips",
+  "deleted_directory": "C:\\Users\\Username\\Videos\\Clips\\deleted",
+  "trimmed_directory": "C:\\Users\\Username\\Videos\\Clips\\trimmed",
+  "ffmpeg_path": null
+}
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
+
+## License
+
+[Add your chosen license here]
+
+## Troubleshooting
+
+### Common Issues
+
+1. **FFmpeg not found**:
+   - Ensure FFmpeg is installed and in PATH
+   - Or set the full path in configuration
+
+2. **Global hotkeys not working**:
+   - Run as administrator if needed
+   - Check for conflicting hotkey assignments
+
+3. **Video files not found**:
+   - Verify OBS replay buffer directory path
+   - Check file naming format matches expected pattern
+
+4. **Performance issues**:
+   - Large video files may take time to process
+   - Consider using proxy files for preview
