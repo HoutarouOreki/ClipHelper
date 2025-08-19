@@ -2,6 +2,7 @@ use eframe::egui;
 use crate::core::{Clip, AppConfig, FileMonitor, NewReplayFile};
 use crate::video::{VideoPreview, WaveformData};
 use crate::hotkeys::{HotkeyManager, HotkeyEvent};
+use crate::gui::timeline::TimelineWidget;
 use std::collections::HashMap;
 use tokio::sync::broadcast;
 use chrono::Utc;
@@ -18,6 +19,11 @@ pub struct ClipHelperApp {
     pub new_clip_name: String,
     pub pending_clip_requests: Vec<(chrono::DateTime<Utc>, crate::core::ClipDuration)>,
     pub watched_directory: Option<std::path::PathBuf>,
+    pub show_directory_dialog: bool,
+    pub status_message: String,
+    pub directory_browser_path: std::path::PathBuf,
+    pub timeline_widget: TimelineWidget,
+    pub show_drives_view: bool,
 }
 
 impl ClipHelperApp {
@@ -80,6 +86,11 @@ impl ClipHelperApp {
             new_clip_name: String::new(),
             pending_clip_requests: Vec::new(),
             watched_directory,
+            show_directory_dialog: false,
+            status_message: String::new(),
+            directory_browser_path: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\")),
+            timeline_widget: TimelineWidget::new(),
+            show_drives_view: false,
         })
     }
 
@@ -283,8 +294,16 @@ impl eframe::App for ClipHelperApp {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui.button("Select OBS Replay Directory").clicked() {
+                        self.show_directory_dialog = true;
+                        ui.close_menu();
+                    }
+                    
+                    ui.separator();
+                    
                     if ui.button("Settings").clicked() {
                         // TODO: Open settings dialog
+                        ui.close_menu();
                     }
                     if ui.button("Exit").clicked() {
                         std::process::exit(0);
@@ -294,6 +313,16 @@ impl eframe::App for ClipHelperApp {
                 ui.menu_button("Help", |ui| {
                     if ui.button("About").clicked() {
                         // TODO: Show about dialog
+                        ui.close_menu();
+                    }
+                });
+                
+                // Show current directory status
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(ref dir) = self.watched_directory {
+                        ui.label(format!("📁 {}", dir.file_name().unwrap_or_default().to_string_lossy()));
+                    } else {
+                        ui.label("❌ No directory selected");
                     }
                 });
             });
@@ -310,9 +339,42 @@ impl eframe::App for ClipHelperApp {
                 }
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Select a clip to edit");
+                    if self.watched_directory.is_some() {
+                        ui.label("Select a clip to edit");
+                    } else {
+                        ui.vertical_centered(|ui| {
+                            ui.heading("Welcome to ClipHelper");
+                            ui.label("To get started, select your OBS replay directory from the File menu.");
+                            ui.add_space(20.0);
+                            if ui.button("📁 Select OBS Replay Directory").clicked() {
+                                self.show_directory_dialog = true;
+                            }
+                        });
+                    }
                 });
             }
+        });
+
+        // Show directory selection dialog
+        if self.show_directory_dialog {
+            self.show_directory_selection_dialog(ctx);
+        }
+
+        // Status bar at bottom
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Status:");
+                if self.status_message.is_empty() {
+                    ui.label("Ready");
+                } else {
+                    ui.label(&self.status_message);
+                }
+                
+                // Hotkey status
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label("Hotkeys: Ctrl+Numpad1-5 (15s/30s/1m/2m/5m)");
+                });
+            });
         });
 
         // Request repaint to handle continuous updates
@@ -324,62 +386,172 @@ impl ClipHelperApp {
     fn show_clip_list(&mut self, ui: &mut egui::Ui) {
         ui.heading("Clips");
         
+        // Status message if no directory selected
+        if self.watched_directory.is_none() {
+            ui.label("❌ No directory selected");
+            ui.small("Select an OBS replay directory from the File menu");
+            return;
+        }
+        
+        // Show directory status
+        if let Some(ref dir) = self.watched_directory {
+            ui.small(format!("📁 {}", dir.file_name().unwrap_or_default().to_string_lossy()));
+        }
+        
+        ui.separator();
+        
+        // Button to scan for existing files
+        if ui.button("🔄 Scan for Replay Files").clicked() {
+            self.scan_and_load_replay_files();
+        }
+        
+        ui.separator();
+        
+        // Show clips
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut selected_index = self.selected_clip_index;
-            
-            for (index, clip) in self.clips.iter().enumerate() {
-                let is_selected = selected_index == Some(index);
+            if self.clips.is_empty() {
+                ui.label("No clips loaded");
+                ui.small("Press the scan button above to load existing replay files");
+                ui.small("Or trigger a hotkey to capture new clips");
+            } else {
+                let mut selected_index = self.selected_clip_index;
                 
-                if ui.selectable_label(is_selected, &clip.get_output_filename()).clicked() {
-                    selected_index = Some(index);
+                for (index, clip) in self.clips.iter().enumerate() {
+                    let is_selected = selected_index == Some(index);
+                    
+                    if ui.selectable_label(is_selected, &clip.get_output_filename()).clicked() {
+                        selected_index = Some(index);
+                    }
+                    
+                    // Show clip duration
+                    ui.small(format!("Duration: {:.1}s", clip.duration_seconds));
                 }
-            }
-            
-            if selected_index != self.selected_clip_index {
-                if let Some(index) = selected_index {
-                    self.select_clip(index);
+                
+                if selected_index != self.selected_clip_index {
+                    if let Some(index) = selected_index {
+                        self.select_clip(index);
+                    }
                 }
             }
         });
+    }
+
+    fn scan_and_load_replay_files(&mut self) {
+        if let Some(ref watched_dir) = self.watched_directory {
+            log::info!("Scanning for existing replay files in: {}", watched_dir.display());
+            
+            match FileMonitor::scan_existing_files(watched_dir) {
+                Ok(existing_files) => {
+                    log::info!("Found {} existing replay files", existing_files.len());
+                    
+                    // Clear existing clips first
+                    self.clips.clear();
+                    self.selected_clip_index = None;
+                    
+                    // Create clips for found files (limit to recent 20 files)
+                    for file in existing_files.into_iter().take(20) {
+                        // Default to 30-second clips for existing files
+                        let file_path = file.path.clone();
+                        match Clip::new(file.path, crate::core::ClipDuration::Seconds30) {
+                            Ok(clip) => {
+                                log::debug!("Loaded existing file: {}", clip.get_output_filename());
+                                self.clips.push(clip);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to create clip for existing file {:?}: {}", file_path, e);
+                            }
+                        }
+                    }
+                    
+                    self.status_message = format!("Loaded {} replay files", self.clips.len());
+                    log::info!("Successfully loaded {} clips from existing files", self.clips.len());
+                }
+                Err(e) => {
+                    log::error!("Failed to scan existing files: {}", e);
+                    self.status_message = format!("Error scanning files: {}", e);
+                }
+            }
+        }
     }
 
     fn show_clip_editor(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Clip Editor");
-        
-        // Clip name input
-        ui.horizontal(|ui| {
-            ui.label("Name:");
-            ui.text_edit_singleline(&mut self.new_clip_name);
-        });
-        
-        // Timeline would go here
-        self.show_timeline(ui);
-        
-        // Control buttons
-        self.show_controls(ui);
-        
-        // Audio track controls
-        self.show_audio_controls(ui);
-        
-        // Action buttons
-        ui.horizontal(|ui| {
-            if ui.button("Apply Trim").clicked() {
-                if let Err(e) = self.apply_trim(false) {
-                    log::error!("Failed to apply trim: {}", e);
-                }
+        if let Some(selected_index) = self.selected_clip_index {
+            if let Some(clip) = self.clips.get(selected_index) {
+                ui.heading("Clip Editor");
+                
+                // Clip info
+                ui.horizontal(|ui| {
+                    ui.label("File:");
+                    ui.label(clip.original_file.file_name().unwrap_or_default().to_string_lossy());
+                });
+                
+                ui.horizontal(|ui| {
+                    ui.label("Duration:");
+                    ui.label(format!("{:.1}s", clip.duration_seconds));
+                    ui.separator();
+                    ui.label("Trim:");
+                    ui.label(format!("{:.1}s - {:.1}s", clip.trim_start, clip.trim_end));
+                });
+                
+                // Clip name input
+                ui.horizontal(|ui| {
+                    ui.label("Output name:");
+                    ui.text_edit_singleline(&mut self.new_clip_name);
+                });
+                
+                ui.separator();
+                
+                // Timeline would go here
+                self.show_timeline(ui);
+                
+                ui.separator();
+                
+                // Control buttons
+                self.show_controls(ui);
+                
+                ui.separator();
+                
+                // Audio track controls
+                self.show_audio_controls(ui);
+                
+                ui.separator();
+                
+                // Action buttons
+                ui.horizontal(|ui| {
+                    if ui.button("✂️ Apply Trim").clicked() {
+                        if let Err(e) = self.apply_trim(false) {
+                            log::error!("Failed to apply trim: {}", e);
+                            self.status_message = format!("Error applying trim: {}", e);
+                        } else {
+                            self.status_message = "Trim applied successfully".to_string();
+                        }
+                    }
+                    
+                    if ui.button("🗑️ Delete").clicked() {
+                        if let Err(e) = self.delete_selected_clip() {
+                            log::error!("Failed to delete clip: {}", e);
+                            self.status_message = format!("Error deleting clip: {}", e);
+                        } else {
+                            self.status_message = "Clip moved to deleted folder".to_string();
+                        }
+                    }
+                    
+                    // Shift+click for force overwrite
+                    ui.separator();
+                    ui.label("Hold Shift and click Apply to overwrite existing files");
+                });
             }
-            
-            if ui.button("Delete").clicked() {
-                if let Err(e) = self.delete_selected_clip() {
-                    log::error!("Failed to delete clip: {}", e);
-                }
-            }
-        });
+        }
     }
 
     fn show_timeline(&mut self, ui: &mut egui::Ui) {
-        ui.label("Timeline (TODO: Implement timeline with scrubbing)");
-        // TODO: Implement proper timeline widget
+        if let Some(selected_index) = self.selected_clip_index {
+            if let Some(clip) = self.clips.get_mut(selected_index) {
+                self.timeline_widget.show(ui, clip, &mut self.video_preview);
+            }
+        } else {
+            ui.label("No clip selected");
+        }
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
@@ -500,5 +672,180 @@ impl ClipHelperApp {
                 });
             }
         }
+    }
+
+    fn show_directory_selection_dialog(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Select OBS Replay Directory")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(600.0)
+            .default_height(400.0)
+            .show(ctx, |ui| {
+                ui.label("Choose the directory where OBS saves your replay files:");
+                
+                // Current path display
+                ui.horizontal(|ui| {
+                    ui.label("Current path:");
+                    if self.show_drives_view {
+                        ui.text_edit_singleline(&mut "This PC".to_string());
+                    } else {
+                        ui.text_edit_singleline(&mut format!("{}", self.directory_browser_path.display()));
+                    }
+                });
+                
+                ui.separator();
+                
+                // Navigation buttons
+                ui.horizontal(|ui| {
+                    if self.show_drives_view {
+                        // When showing drives, only show back button if we came from a directory
+                        if ui.button("📁 Browse Directories").clicked() {
+                            self.show_drives_view = false;
+                        }
+                    } else {
+                        if ui.button("⬆ Parent Directory").clicked() {
+                            if let Some(parent) = self.directory_browser_path.parent() {
+                                self.directory_browser_path = parent.to_path_buf();
+                            }
+                        }
+                        
+                        if ui.button("💻 This PC").clicked() {
+                            self.show_drives_view = true;
+                        }
+                    }
+                });
+                
+                ui.separator();
+                
+                // Directory listing
+                egui::ScrollArea::vertical()
+                    .max_height(250.0)
+                    .show(ui, |ui| {
+                        if self.show_drives_view {
+                            // Show available drives
+                            ui.label("Available Drives:");
+                            ui.separator();
+                            
+                            let mut found_drives = false;
+                            for drive_letter in 'A'..='Z' {
+                                let drive_path = format!("{}:\\", drive_letter);
+                                let drive_pathbuf = std::path::PathBuf::from(&drive_path);
+                                
+                                // Check if drive exists by trying to read the root directory
+                                if drive_pathbuf.exists() && std::fs::read_dir(&drive_pathbuf).is_ok() {
+                                    found_drives = true;
+                                    let drive_name = get_drive_label(&drive_pathbuf).unwrap_or_else(|| {
+                                        format!("Local Disk ({}:)", drive_letter)
+                                    });
+                                    
+                                    if ui.selectable_label(false, format!("💽 {} ({}:)", drive_name, drive_letter)).clicked() {
+                                        self.directory_browser_path = drive_pathbuf;
+                                        self.show_drives_view = false;
+                                    }
+                                }
+                            }
+                            
+                            if !found_drives {
+                                ui.label("❌ No accessible drives found");
+                            }
+                        } else {
+                            // Show directory contents
+                            if let Ok(entries) = std::fs::read_dir(&self.directory_browser_path) {
+                                let mut dirs: Vec<_> = entries
+                                    .filter_map(|e| e.ok())
+                                    .filter(|e| e.path().is_dir())
+                                    .collect();
+                                dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                                
+                                for entry in dirs {
+                                    let name = entry.file_name().to_string_lossy().to_string();
+                                    if ui.selectable_label(false, format!("📁 {}", name)).clicked() {
+                                        self.directory_browser_path = entry.path();
+                                        self.show_drives_view = false;
+                                    }
+                                }
+                            } else {
+                                ui.label("❌ Unable to read directory");
+                            }
+                        }
+                    });
+                
+                ui.separator();
+                
+                // Action buttons
+                ui.horizontal(|ui| {
+                    if ui.button("✅ Select This Directory").clicked() {
+                        self.set_watched_directory(self.directory_browser_path.clone());
+                        self.show_directory_dialog = false;
+                    }
+                    
+                    if ui.button("❌ Cancel").clicked() {
+                        self.show_directory_dialog = false;
+                    }
+                });
+            });
+    }
+
+    fn set_watched_directory(&mut self, path: std::path::PathBuf) {
+        log::info!("Setting watched directory to: {}", path.display());
+        
+        // Stop existing file monitoring
+        self.file_monitor = None;
+        self.file_receiver = None;
+        
+        // Start new file monitoring
+        match FileMonitor::new(&path) {
+            Ok((monitor, receiver)) => {
+                self.file_monitor = Some(monitor);
+                self.file_receiver = Some(receiver);
+                self.watched_directory = Some(path.clone());
+                
+                // Update config and save
+                self.config.last_watched_directory = Some(path.clone());
+                if let Err(e) = self.config.save() {
+                    log::error!("Failed to save config: {}", e);
+                } else {
+                    log::info!("Config saved with new watched directory");
+                }
+                
+                // Update directory paths in config
+                self.config.obs_replay_directory = path.clone();
+                self.config.deleted_directory = path.join("deleted");
+                self.config.trimmed_directory = path.join("trimmed");
+                
+                // Ensure directories exist
+                if let Err(e) = self.config.ensure_directories() {
+                    log::error!("Failed to ensure directories: {}", e);
+                }
+                
+                // Load existing clips
+                self.load_existing_clips();
+                
+                self.status_message = format!("Successfully set directory: {}", path.display());
+                log::info!("File monitoring started for directory: {}", path.display());
+            }
+            Err(e) => {
+                log::error!("Failed to start file monitoring: {}", e);
+                self.status_message = format!("Failed to monitor directory: {}", e);
+            }
+        }
+    }
+}
+
+// Helper function to get drive labels on Windows
+fn get_drive_label(drive_path: &std::path::Path) -> Option<String> {
+    // For now, return a simple default name
+    // On Windows, you could use Windows API to get the actual volume label
+    // but for simplicity, we'll use generic names
+    if let Some(drive_str) = drive_path.to_str() {
+        match &drive_str[..1] {
+            "C" => Some("Windows (C:)".to_string()),
+            "D" => Some("Data (D:)".to_string()),
+            "E" => Some("External (E:)".to_string()),
+            "F" => Some("Drive (F:)".to_string()),
+            _ => Some(format!("Local Disk ({}:)", &drive_str[..1])),
+        }
+    } else {
+        None
     }
 }
