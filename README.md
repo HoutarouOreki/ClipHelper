@@ -7,18 +7,29 @@ A Rust application designed to help streamline the process of trimming and organ
 ## Features
 
 ### Core Functionality
-- **Global Hotkeys**: Capture clips with Ctrl+1-5 for different durations (15s, 30s, 1m, 2m, 5m)
+- **Global Hotkeys**: Capture clips with Ctrl+Numpad1-5 for different durations (15s, 30s, 1m, 2m, 5m)
 - **Smart File Matching**: Automatically matches timestamps to replay files within a 10-second window
+- **Real-time Auto-detection**: New replay files automatically appear in clip list immediately
+- **Session Grouping**: Clips organized by recording sessions (gaps > 1 hour create new sessions)
 - **Timeline Editor**: Visual timeline with scrubbing controls for precise trimming
 - **Video Preview**: Built-in video player with playback controls
 - **Audio Track Management**: Enable/disable tracks and configure surround sound options
+- **Non-blocking Startup**: UI loads immediately, video info loads in background
+
+### Enhanced User Interface
+- **300px wide sidebar** with full-width scrollable clip list
+- **Session display format**: "2025-08-19 - session 14:56 - 17:11" (newest sessions first)
+- **Rich duration display**: 
+  - Video length: "2m 40s" (actual file duration)
+  - Target length: "30s" (from hotkey trigger)
+- **Auto-refresh**: Manual refresh button and automatic detection of new files
 
 ### Hotkey Mappings
-- `Ctrl+1` = 15 second clip
-- `Ctrl+2` = 30 second clip  
-- `Ctrl+3` = 1 minute clip
-- `Ctrl+4` = 2 minute clip
-- `Ctrl+5` = 5 minute clip
+- `Ctrl+Numpad1` = 15 second clip
+- `Ctrl+Numpad2` = 30 second clip  
+- `Ctrl+Numpad3` = 1 minute clip
+- `Ctrl+Numpad4` = 2 minute clip
+- `Ctrl+Numpad5` = 5 minute clip
 
 ### Controls
 - **Playback**: Play/pause, seek to start, seek to last 5 seconds

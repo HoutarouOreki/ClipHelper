@@ -7,6 +7,14 @@ use std::collections::HashMap;
 use tokio::sync::broadcast;
 use chrono::Utc;
 
+#[derive(Debug, Clone)]
+pub struct SessionGroup {
+    pub date: String, // "2025-08-19"
+    pub start_time: String, // "14:56"
+    pub end_time: String, // "17:11"
+    pub clips: Vec<usize>, // indices into the main clips vector
+}
+
 pub struct ClipHelperApp {
     pub config: AppConfig,
     pub clips: Vec<Clip>,
@@ -24,6 +32,8 @@ pub struct ClipHelperApp {
     pub directory_browser_path: std::path::PathBuf,
     pub timeline_widget: TimelineWidget,
     pub show_drives_view: bool,
+    /// Last time we checked for video info updates (for clips that might still be writing)
+    pub last_video_info_check: std::time::Instant,
 }
 
 impl ClipHelperApp {
@@ -74,9 +84,34 @@ impl ClipHelperApp {
             (None, None, None)
         };
 
+        // Load existing clips from the watched directory (without blocking on video info)
+        let mut clips = Vec::new();
+        if let Some(ref dir) = watched_directory {
+            log::info!("Loading existing clips from {}", dir.display());
+            match FileMonitor::scan_existing_files(dir) {
+                Ok(existing_files) => {
+                    log::info!("Found {} existing replay files, loading most recent 50 for startup", existing_files.len());
+                    for file in existing_files.into_iter().take(50) {
+                        match Clip::new_without_target(file.path) {
+                            Ok(clip) => {
+                                // Don't populate video info at startup - let it load in background
+                                clips.push(clip);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to create clip from existing file: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to scan existing files: {}", e);
+                }
+            }
+        }
+
         Ok(Self {
             config,
-            clips: Vec::new(),
+            clips,
             selected_clip_index: None,
             video_preview: None,
             waveforms: HashMap::new(),
@@ -91,6 +126,7 @@ impl ClipHelperApp {
             directory_browser_path: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\")),
             timeline_widget: TimelineWidget::new(),
             show_drives_view: false,
+            last_video_info_check: std::time::Instant::now(),
         })
     }
 
@@ -109,6 +145,25 @@ impl ClipHelperApp {
     pub fn select_clip(&mut self, index: usize) {
         if index < self.clips.len() {
             self.selected_clip_index = Some(index);
+            
+            // Lazily load video info for the selected clip if not already loaded
+            if let Some(clip) = self.clips.get_mut(index) {
+                if clip.video_length_seconds.is_none() {
+                    log::debug!("Loading video info for selected clip: {}", clip.get_output_filename());
+                    match clip.populate_video_info() {
+                        Ok(is_valid) => {
+                            if is_valid {
+                                log::debug!("Video info loaded successfully for {}", clip.get_output_filename());
+                            } else {
+                                log::debug!("Video info loaded but file is still being written: {}", clip.get_output_filename());
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to get video info for {}: {}", clip.get_output_filename(), e);
+                        }
+                    }
+                }
+            }
             
             // Initialize video preview for selected clip
             if let Some(clip) = self.clips.get(index) {
@@ -163,11 +218,44 @@ impl ClipHelperApp {
                     let now = Utc::now();
                     log::info!("Hotkey triggered for {:?} at {}", duration, now);
                     
-                    // Store the clip request with timestamp
+                    // First, try to find existing clips that match this timestamp
+                    // This includes clips that might be grayed out (still being written)
+                    let mut found_existing = false;
+                    for clip in &mut self.clips {
+                        if clip.matches_timestamp(now) {
+                            log::info!("Setting target duration for existing clip: {}", clip.get_output_filename());
+                            clip.set_target_duration(duration.clone());
+                            found_existing = true;
+                            
+                            // If the clip needs video info update, try to update it now
+                            if clip.needs_video_info_update() {
+                                match clip.populate_video_info() {
+                                    Ok(is_valid) => {
+                                        if is_valid {
+                                            log::info!("Video info updated after setting target duration for {}", clip.get_output_filename());
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // File might still be writing, will be updated later
+                                    }
+                                }
+                            }
+                            break; // Only update the first matching clip
+                        }
+                    }
+                    
+                    // Always store the clip request for future file matching, even if we found existing clips
+                    // This ensures that if OBS creates a new file shortly after the hotkey,
+                    // it will get the correct target duration. This handles the case where:
+                    // 1. User presses hotkey
+                    // 2. OBS hasn't created the file yet (or file hasn't been detected)
+                    // 3. File appears later and should still get the target duration applied
                     self.pending_clip_requests.push((now, duration.clone()));
                     
-                    // Try to match with recent files
-                    self.try_match_clip_request(now, duration);
+                    // If no existing clip matched, try to match with recent files
+                    if !found_existing {
+                        self.try_match_clip_request(now, duration);
+                    }
                 }
             }
         }
@@ -185,7 +273,7 @@ impl ClipHelperApp {
         
         // Process each new file
         for new_file in new_files {
-            // Check if this file matches any pending clip requests
+            // First, check if this file matches any pending clip requests
             let mut matched_requests = Vec::new();
             
             for (i, (request_time, duration)) in self.pending_clip_requests.iter().enumerate() {
@@ -196,8 +284,14 @@ impl ClipHelperApp {
             
             // Process matched requests
             for (index, file, duration) in matched_requests.iter().rev() {
-                self.create_clip_from_file(file.clone(), duration.clone());
+                self.create_clip_from_file(file.clone(), Some(duration.clone()));
                 self.pending_clip_requests.remove(*index);
+            }
+            
+            // If no hotkey request matched, still add the file to the clip list automatically
+            if matched_requests.is_empty() {
+                log::info!("Auto-adding new replay file to clip list: {:?}", new_file.path);
+                self.create_clip_from_file(new_file, None);
             }
         }
     }
@@ -208,7 +302,7 @@ impl ClipHelperApp {
             if let Ok(existing_files) = FileMonitor::scan_existing_files(watched_dir) {
                 for file in existing_files {
                     if self.timestamps_match(request_time, file.timestamp) {
-                        self.create_clip_from_file(file, duration);
+                        self.create_clip_from_file(file, Some(duration));
                         // Remove the pending request
                         self.pending_clip_requests.retain(|(time, _)| *time != request_time);
                         return;
@@ -241,7 +335,7 @@ impl ClipHelperApp {
         
         // Create clips
         for (file, duration) in clips_to_create {
-            self.create_clip_from_file(file, duration);
+            self.create_clip_from_file(file, Some(duration));
         }
     }
     
@@ -254,9 +348,18 @@ impl ClipHelperApp {
         diff <= 10 // Within 10 seconds
     }
     
-    fn create_clip_from_file(&mut self, file: NewReplayFile, duration: crate::core::ClipDuration) {
-        match Clip::new(file.path, duration) {
+    fn create_clip_from_file(&mut self, file: NewReplayFile, duration: Option<crate::core::ClipDuration>) {
+        let clip_result = if let Some(duration) = duration {
+            // Create clip with specific target duration (from hotkey)
+            Clip::new(file.path, duration)
+        } else {
+            // Create clip without target duration (auto-detected file)
+            Clip::new_without_target(file.path)
+        };
+        
+        match clip_result {
             Ok(clip) => {
+                // Don't block on video info - load it lazily when needed
                 log::info!("Created clip: {}", clip.get_output_filename());
                 self.clips.push(clip);
             }
@@ -270,10 +373,175 @@ impl ClipHelperApp {
         if let Some(ref watched_dir) = self.watched_directory {
             if let Ok(existing_files) = FileMonitor::scan_existing_files(watched_dir) {
                 log::info!("Found {} existing replay files", existing_files.len());
-                // For now, just log them. Later we could offer to import them.
-                for file in existing_files.iter().take(10) { // Show first 10
-                    log::info!("Existing file: {:?}", file.path.file_name());
+                // Files are logged during auto-refresh or manual scan
+            }
+        }
+    }
+
+    fn force_refresh_clips(&mut self) {
+        // Force refresh regardless of current state
+        if let Some(ref watched_dir) = self.watched_directory {
+            log::debug!("Force refreshing clip list...");
+            self.clips.clear(); // Clear existing clips
+            
+            match FileMonitor::scan_existing_files(watched_dir) {
+                Ok(existing_files) => {
+                    if !existing_files.is_empty() {
+                        log::info!("Force refresh found {} files", existing_files.len());
+                        
+                        // Create clips for all found files
+                        for file in existing_files {
+                            let file_path = file.path.clone();
+                            match Clip::new_without_target(file.path) {
+                                Ok(clip) => {
+                                    // Don't block on video info during refresh
+                                    log::debug!("Force-loaded file: {}", clip.get_output_filename());
+                                    self.clips.push(clip);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to force-load clip for file {:?}: {}", file_path, e);
+                                }
+                            }
+                        }
+                        
+                        self.status_message = format!("Refreshed {} clips", self.clips.len());
+                    } else {
+                        self.status_message = "No replay files found".to_string();
+                    }
                 }
+                Err(e) => {
+                    log::error!("Force refresh scan failed: {}", e);
+                    self.status_message = format!("Refresh failed: {}", e);
+                }
+            }
+        } else {
+            self.status_message = "No directory being watched".to_string();
+        }
+    }
+
+    fn group_clips_into_sessions(&self) -> Vec<SessionGroup> {
+        if self.clips.is_empty() {
+            return Vec::new();
+        }
+
+        let mut sessions = Vec::new();
+        let mut current_session_clips = Vec::new();
+        let mut session_start_time: Option<chrono::DateTime<Utc>> = None;
+        let mut last_clip_time: Option<chrono::DateTime<Utc>> = None;
+
+        // Sort clips by timestamp
+        let mut sorted_indices: Vec<usize> = (0..self.clips.len()).collect();
+        sorted_indices.sort_by(|&a, &b| self.clips[a].timestamp.cmp(&self.clips[b].timestamp));
+
+        for &index in &sorted_indices {
+            let clip = &self.clips[index];
+            
+            // Check if this clip starts a new session (gap > 1 hour)
+            let starts_new_session = if let Some(last_time) = last_clip_time {
+                let time_diff = clip.timestamp.signed_duration_since(last_time);
+                time_diff.num_hours() >= 1
+            } else {
+                true // First clip always starts a new session
+            };
+
+            if starts_new_session && !current_session_clips.is_empty() {
+                // Finish current session
+                if let Some(start_time) = session_start_time {
+                    if let Some(end_time) = last_clip_time {
+                        let session = SessionGroup {
+                            date: start_time.format("%Y-%m-%d").to_string(),
+                            start_time: start_time.format("%H:%M").to_string(),
+                            end_time: end_time.format("%H:%M").to_string(),
+                            clips: current_session_clips.clone(),
+                        };
+                        sessions.push(session);
+                    }
+                }
+                current_session_clips.clear();
+            }
+
+            // Start new session if needed
+            if current_session_clips.is_empty() {
+                session_start_time = Some(clip.timestamp);
+            }
+
+            current_session_clips.push(index);
+            last_clip_time = Some(clip.timestamp);
+        }
+
+        // Add the last session
+        if !current_session_clips.is_empty() {
+            if let Some(start_time) = session_start_time {
+                if let Some(end_time) = last_clip_time {
+                    let session = SessionGroup {
+                        date: start_time.format("%Y-%m-%d").to_string(),
+                        start_time: start_time.format("%H:%M").to_string(),
+                        end_time: end_time.format("%H:%M").to_string(),
+                        clips: current_session_clips,
+                    };
+                    sessions.push(session);
+                }
+            }
+        }
+
+        sessions.reverse(); // Show newest sessions first
+        sessions
+    }
+
+    /// Ensures video info is loaded for a specific clip index
+    /// Used for background loading when clips are displayed
+    fn ensure_video_info_loaded(&mut self, clip_index: usize) {
+        if let Some(clip) = self.clips.get_mut(clip_index) {
+            if clip.needs_video_info_update() {
+                match clip.populate_video_info() {
+                    Ok(is_valid) => {
+                        if is_valid {
+                            log::debug!("Video info updated for {}", clip.get_output_filename());
+                        } else {
+                            log::debug!("Video info checked but file still being written: {}", clip.get_output_filename());
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("Failed to update video info for {}: {}", clip.get_output_filename(), e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Periodically updates video info for clips that need it
+    /// This ensures that clips being written by OBS get updated when they're finished
+    /// 
+    /// IMPORTANT: This method is called every frame from the main update loop to ensure
+    /// that grayed-out files (files still being written by OBS) get their video info
+    /// updated as soon as the file becomes valid. This provides a smooth user experience
+    /// where files automatically transition from grayed-out to selectable.
+    fn update_pending_video_info(&mut self) {
+        let now = std::time::Instant::now();
+        
+        // Check every 2 seconds to avoid excessive file system operations
+        if now.duration_since(self.last_video_info_check).as_secs() >= 2 {
+            self.last_video_info_check = now;
+            
+            let mut updated_count = 0;
+            for clip in &mut self.clips {
+                if clip.needs_video_info_update() {
+                    match clip.populate_video_info() {
+                        Ok(is_valid) => {
+                            if is_valid {
+                                log::debug!("Video info updated for {}", clip.get_output_filename());
+                                updated_count += 1;
+                            }
+                        }
+                        Err(_) => {
+                            // File might not exist yet or still being written, ignore error
+                        }
+                    }
+                }
+            }
+            
+            if updated_count > 0 {
+                log::info!("Updated video info for {} clips", updated_count);
             }
         }
     }
@@ -286,6 +554,9 @@ impl eframe::App for ClipHelperApp {
         // Process events
         self.process_hotkey_events();
         self.process_file_events();
+        
+        // Update video info for clips that might still be writing
+        self.update_pending_video_info();
         
         // Periodic cleanup of old clip requests
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(30);
@@ -328,9 +599,12 @@ impl eframe::App for ClipHelperApp {
             });
         });
 
-        egui::SidePanel::left("clip_list").show(ctx, |ui| {
-            self.show_clip_list(ui);
-        });
+        egui::SidePanel::left("clip_list")
+            .default_width(300.0)
+            .min_width(250.0)
+            .show(ctx, |ui| {
+                self.show_clip_list(ui);
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(selected_index) = self.selected_clip_index {
@@ -401,39 +675,102 @@ impl ClipHelperApp {
         ui.separator();
         
         // Button to scan for existing files
-        if ui.button("🔄 Scan for Replay Files").clicked() {
-            self.scan_and_load_replay_files();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("🔄 Scan for Replay Files").clicked() {
+                self.scan_and_load_replay_files();
+            }
+            
+            if ui.button("♻️ Refresh").clicked() {
+                self.force_refresh_clips();
+            }
+        });
         
         ui.separator();
         
-        // Show clips
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if self.clips.is_empty() {
-                ui.label("No clips loaded");
-                ui.small("Press the scan button above to load existing replay files");
-                ui.small("Or trigger a hotkey to capture new clips");
-            } else {
-                let mut selected_index = self.selected_clip_index;
-                
-                for (index, clip) in self.clips.iter().enumerate() {
-                    let is_selected = selected_index == Some(index);
+        // Show clips grouped by sessions
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.clips.is_empty() {
+                    ui.label("No clips loaded");
+                    ui.small("Press the scan button above to load existing replay files");
+                    ui.small("Or trigger a hotkey to capture new clips");
+                } else {
+                    let sessions = self.group_clips_into_sessions();
+                    let mut selected_index = self.selected_clip_index;
+                    let mut clips_needing_info = Vec::new();
                     
-                    if ui.selectable_label(is_selected, &clip.get_output_filename()).clicked() {
-                        selected_index = Some(index);
+                    for session in sessions {
+                        // Session header
+                        ui.group(|ui| {
+                            ui.label(format!("{} - session {} - {}", 
+                                session.date, session.start_time, session.end_time));
+                        });
+                        
+                        ui.indent("session_clips", |ui| {
+                            for &clip_index in &session.clips {
+                                if let Some(clip) = self.clips.get(clip_index) {
+                                    let is_selected = selected_index == Some(clip_index);
+                                    let is_valid = clip.is_video_valid();
+                                    
+                                    // Gray out invalid files
+                                    let text_color = if is_valid {
+                                        ui.visuals().text_color()
+                                    } else {
+                                        ui.visuals().weak_text_color()
+                                    };
+                                    
+                                    ui.group(|ui| {
+                                        ui.scope(|ui| {
+                                            ui.visuals_mut().override_text_color = Some(text_color);
+                                            
+                                            if ui.selectable_label(is_selected, &clip.get_output_filename()).clicked() && is_valid {
+                                                selected_index = Some(clip_index);
+                                            }
+                                            
+                                            // Show video length and target duration on separate lines
+                                            if let Some(video_length) = clip.video_length_seconds {
+                                                if video_length >= 1.0 {
+                                                    ui.small(format!("Video: {}", Clip::format_duration(video_length)));
+                                                } else {
+                                                    ui.small("Video: Invalid (<1s)");
+                                                }
+                                            } else {
+                                                ui.small("Video: Loading...");
+                                                // Mark for background loading
+                                                clips_needing_info.push(clip_index);
+                                            }
+                                            
+                                            // Show target duration only if set
+                                            if clip.has_target_duration() {
+                                                ui.small(format!("Target: {}", Clip::format_duration(clip.duration_seconds as f64)));
+                                            } else {
+                                                ui.small("Target: Not set");
+                                            }
+                                        });
+                                    });
+                                    
+                                    ui.add_space(4.0);
+                                }
+                            }
+                        });
+                        
+                        ui.add_space(8.0);
                     }
                     
-                    // Show clip duration
-                    ui.small(format!("Duration: {:.1}s", clip.duration_seconds));
-                }
-                
-                if selected_index != self.selected_clip_index {
-                    if let Some(index) = selected_index {
-                        self.select_clip(index);
+                    // Update selected clip
+                    if selected_index != self.selected_clip_index {
+                        if let Some(index) = selected_index {
+                            self.select_clip(index);
+                        }
+                    }
+                    
+                    // Load video info for clips that need it (after UI to avoid borrowing issues)
+                    for clip_index in clips_needing_info {
+                        self.ensure_video_info_loaded(clip_index);
                     }
                 }
-            }
-        });
+            });
     }
 
     fn scan_and_load_replay_files(&mut self) {
@@ -450,9 +787,9 @@ impl ClipHelperApp {
                     
                     // Create clips for found files (limit to recent 20 files)
                     for file in existing_files.into_iter().take(20) {
-                        // Default to 30-second clips for existing files
+                        // Create clips without target duration for existing files
                         let file_path = file.path.clone();
-                        match Clip::new(file.path, crate::core::ClipDuration::Seconds30) {
+                        match Clip::new_without_target(file.path) {
                             Ok(clip) => {
                                 log::debug!("Loaded existing file: {}", clip.get_output_filename());
                                 self.clips.push(clip);

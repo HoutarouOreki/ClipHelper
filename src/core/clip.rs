@@ -7,7 +7,8 @@ pub struct Clip {
     pub id: String,
     pub original_file: PathBuf,
     pub timestamp: DateTime<Utc>,
-    pub duration_seconds: u32,
+    pub duration_seconds: u32, // Target duration (from hotkey)
+    pub video_length_seconds: Option<f64>, // Actual video file duration
     pub name: Option<String>,
     pub trim_start: f64, // seconds from start
     pub trim_end: f64,   // seconds from start
@@ -43,9 +44,28 @@ impl Clip {
             original_file: file,
             timestamp,
             duration_seconds,
+            video_length_seconds: None, // Will be populated later when needed
             name: None,
             trim_start: 0.0,
             trim_end: duration_seconds as f64,
+            audio_tracks: Vec::new(),
+            is_deleted: false,
+            is_trimmed: false,
+        })
+    }
+
+    pub fn new_without_target(file: PathBuf) -> anyhow::Result<Self> {
+        let timestamp = Self::extract_timestamp_from_filename(&file)?;
+        
+        Ok(Clip {
+            id: uuid::Uuid::new_v4().to_string(),
+            original_file: file,
+            timestamp,
+            duration_seconds: 0, // No target duration
+            video_length_seconds: None, // Will be populated later when needed
+            name: None,
+            trim_start: 0.0,
+            trim_end: 0.0, // Will be set to video length when loaded
             audio_tracks: Vec::new(),
             is_deleted: false,
             is_trimmed: false,
@@ -90,6 +110,88 @@ impl Clip {
     pub fn matches_timestamp(&self, target_time: DateTime<Utc>) -> bool {
         let time_diff = (target_time - self.timestamp).num_seconds().abs();
         time_diff <= 10 // Within 10 seconds
+    }
+
+    pub fn format_duration(seconds: f64) -> String {
+        let total_seconds = seconds as u32;
+        let minutes = total_seconds / 60;
+        let remaining_seconds = total_seconds % 60;
+        
+        if minutes > 0 {
+            format!("{}m {}s", minutes, remaining_seconds)
+        } else {
+            format!("{}s", remaining_seconds)
+        }
+    }
+
+    /// Checks if this clip has a valid target duration set (> 0 seconds)
+    pub fn has_target_duration(&self) -> bool {
+        self.duration_seconds > 0
+    }
+
+    /// Checks if the video file is valid (duration >= 1 second)
+    /// Returns false if video info hasn't been loaded yet
+    pub fn is_video_valid(&self) -> bool {
+        if let Some(length) = self.video_length_seconds {
+            length >= 1.0 // Video must be at least 1 second
+        } else {
+            false // Unknown length = not valid yet
+        }
+    }
+
+    /// Checks if this clip needs video info to be loaded/updated
+    /// Returns true if video info is missing or if the file might still be being written
+    pub fn needs_video_info_update(&self) -> bool {
+        match self.video_length_seconds {
+            None => true, // No video info loaded yet
+            Some(length) => length < 1.0, // Invalid length, might still be writing
+        }
+    }
+
+    /// Sets the target duration for this clip and updates trim end if needed
+    /// This is called when a hotkey assigns a specific duration to the clip
+    pub fn set_target_duration(&mut self, duration: ClipDuration) {
+        self.duration_seconds = duration as u32;
+        if self.trim_end == 0.0 || !self.has_target_duration() {
+            // Set trim end to target duration if no target was set before
+            self.trim_end = self.duration_seconds as f64;
+        }
+    }
+
+    /// Attempts to populate video information from the file
+    /// Returns Ok(true) if video info was successfully loaded and is valid
+    /// Returns Ok(false) if file exists but video info is invalid (still being written)
+    /// Returns Err if file doesn't exist or other error occurred
+    pub fn populate_video_info(&mut self) -> anyhow::Result<bool> {
+        use crate::video::VideoProcessor;
+        
+        // Check if file exists first
+        if !self.original_file.exists() {
+            return Err(anyhow::anyhow!("File does not exist: {:?}", self.original_file));
+        }
+        
+        match VideoProcessor::get_video_info(&self.original_file) {
+            Ok(video_info) => {
+                self.video_length_seconds = Some(video_info.duration);
+                self.audio_tracks = video_info.audio_tracks;
+                
+                // If no target duration was set, use full video length as trim end
+                if !self.has_target_duration() && self.trim_end == 0.0 {
+                    self.trim_end = video_info.duration;
+                }
+                
+                // Return whether the video is valid (duration >= 1 second)
+                Ok(video_info.duration >= 1.0)
+            }
+            Err(e) => {
+                // If we can't get video info, the file might still be being written
+                // Set duration to 0 to indicate it's invalid but keep trying
+                self.video_length_seconds = Some(0.0);
+                log::debug!("Video info not available yet for {}: {}", 
+                    self.get_output_filename(), e);
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -170,6 +272,98 @@ mod tests {
         assert!(track.enabled);
         assert!(!track.surround_mode);
         assert_eq!(track.name, "Desktop Audio");
+    }
+
+    #[test]
+    fn test_clip_without_target_duration() {
+        let file_path = PathBuf::from("Replay 2025-08-17 21-52-01.mkv");
+        let clip = Clip::new_without_target(file_path.clone());
+        
+        assert!(clip.is_ok());
+        let clip = clip.unwrap();
+        assert_eq!(clip.duration_seconds, 0);
+        assert!(!clip.has_target_duration());
+        assert_eq!(clip.trim_start, 0.0);
+        assert_eq!(clip.trim_end, 0.0);
+        assert_eq!(clip.original_file, file_path);
+    }
+
+    #[test]
+    fn test_set_target_duration() {
+        let file_path = PathBuf::from("Replay 2025-08-17 21-52-01.mkv");
+        let mut clip = Clip::new_without_target(file_path).unwrap();
+        
+        // Initially no target duration
+        assert!(!clip.has_target_duration());
+        
+        // Set target duration
+        clip.set_target_duration(ClipDuration::Seconds15);
+        assert!(clip.has_target_duration());
+        assert_eq!(clip.duration_seconds, 15);
+        assert_eq!(clip.trim_end, 15.0);
+    }
+
+    #[test]
+    fn test_video_validity() {
+        let file_path = PathBuf::from("Replay 2025-08-17 21-52-01.mkv");
+        let mut clip = Clip::new_without_target(file_path).unwrap();
+        
+        // Initially not valid (no video info)
+        assert!(!clip.is_video_valid());
+        
+        // Set valid video length
+        clip.video_length_seconds = Some(120.0);
+        assert!(clip.is_video_valid());
+        
+        // Set invalid video length
+        clip.video_length_seconds = Some(0.5);
+        assert!(!clip.is_video_valid());
+    }
+
+    #[test]
+    fn test_needs_video_info_update() {
+        let file_path = PathBuf::from("Replay 2025-08-17 21-52-01.mkv");
+        let mut clip = Clip::new_without_target(file_path).unwrap();
+        
+        // Initially needs update (no video info)
+        assert!(clip.needs_video_info_update());
+        
+        // Set valid video length
+        clip.video_length_seconds = Some(120.0);
+        assert!(!clip.needs_video_info_update());
+        
+        // Set invalid video length (still being written)
+        clip.video_length_seconds = Some(0.5);
+        assert!(clip.needs_video_info_update());
+        
+        // Reset to None
+        clip.video_length_seconds = None;
+        assert!(clip.needs_video_info_update());
+    }
+
+    #[test]
+    fn test_target_duration_with_video_info_lifecycle() {
+        let file_path = PathBuf::from("Replay 2025-08-17 21-52-01.mkv");
+        let mut clip = Clip::new_without_target(file_path).unwrap();
+        
+        // Initially no target duration and no video info
+        assert!(!clip.has_target_duration());
+        assert!(clip.needs_video_info_update());
+        
+        // Set target duration before video info is loaded
+        clip.set_target_duration(ClipDuration::Seconds30);
+        assert!(clip.has_target_duration());
+        assert_eq!(clip.duration_seconds, 30);
+        assert_eq!(clip.trim_end, 30.0);
+        
+        // Simulate video info being loaded later
+        clip.video_length_seconds = Some(60.0);
+        assert!(!clip.needs_video_info_update());
+        assert!(clip.is_video_valid());
+        
+        // Target duration should still be preserved
+        assert!(clip.has_target_duration());
+        assert_eq!(clip.duration_seconds, 30);
     }
 
     #[test]

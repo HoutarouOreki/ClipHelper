@@ -1,45 +1,6 @@
 # ClipHelper AI Assistant Instructions
 
-ClipHelper is a Rust application for trimming OBS replay buffer clips with global hotkeys, timeline editing, and FFmpeg integration. It helps streamline the process of capturing and editing gaming clips from OBS replay buffer with precise timing controls.
-
-## Core Functionality
-
-### Global Hotkey System
-- **Ctrl+1**: Capture 15-second clip
-- **Ctrl+2**: Capture 30-second clip  
-- **Ctrl+3**: Capture 1-minute clip
-- **Ctrl+4**: Capture 2-minute clip
-- **Ctrl+5**: Capture 5-minute clip
-
-### Smart File Matching
-- Monitors OBS replay directory for "Replay YYYY-MM-DD HH-MM-SS.mkv" files
-- Matches hotkey timestamps to replay files within 10-second tolerance window
-- Automatically identifies the closest matching replay file for clip creation
-
-### Timeline Editor Interface
-- Visual timeline with scrubbing controls for precise navigation
-- Draggable trim handles for start/end point adjustment
-- Video preview with playback controls (play/pause, seek, frame stepping)
-- Audio waveform visualization for multiple tracks
-- Time-based navigation: skip 3s/5s/10s forward/backward, go to start/end
-
-### Advanced Audio Management
-- Multiple audio track support with individual enable/disable
-- Surround sound channel mapping (FL|FR for spatial audio): Maps selected tracks to front-left/front-right channels so they can be disabled separately while still being audible in the mixed output
-- Track mixing: Track 1 = mixed output, Track 2+ = original tracks preserved
-- Visual audio controls with surround mode checkboxes
-
-### Precise Trim Controls
-- Start/end time adjustment buttons: ±1s, ±5s increments
-- Timeline scrubbing with frame-accurate positioning
-- Real-time preview of trim points
-- Custom clip naming with format: "Original Name - Custom Name.mkv"
-
-### File Management System
-- **Apply**: Trims clip and saves to "trimmed/" directory within the watched OBS replay directory
-- **Delete**: Moves original file to "deleted/" directory within the watched OBS replay directory
-- Original replay files never modified
-- Organized output structure with separate folders for different operations within the monitored directory
+ClipHelper is a Rust application for trimming OBS replay buffer clips with global hotkeys, timeline editing, and FFmpeg integration. This document provides development guidance for AI assistants working on the codebase.
 
 ## Architecture Overview
 
@@ -57,44 +18,48 @@ Clips match OBS replay files within 10-second windows using filename parsing:
 pub fn extract_timestamp_from_filename(file: &PathBuf) -> anyhow::Result<DateTime<Utc>>
 ```
 
+### Session Grouping Algorithm
+Clips are automatically grouped into recording sessions:
+- Sessions created when gap between clips > 1 hour
+- Sessions displayed in descending chronological order (newest first)
+- Format: "YYYY-MM-DD - session HH:MM - HH:MM"
+
 ### Audio Track Architecture
 Complex audio handling with surround sound and track mixing:
 - Track 1 = mixed output from enabled tracks
 - Track 2+ = original tracks preserved
-- `surround_mode` maps FL|FR channels for spatial audio: This allows tracks to be disabled separately while still being audible in the mixed output
+- `surround_mode` maps FL|FR channels for spatial audio
 
 ### FFmpeg Integration
 Command-line FFmpeg for maximum compatibility. Key patterns:
 - Use `-c:v copy` for fast video copying without re-encoding
 - Generate complex filter graphs for audio track mixing
-- Use `-y` flag to overwrite outputs only when shift-clicking (normal clicks should prompt for confirmation)
+- Use `-y` flag to overwrite outputs only when shift-clicking
+
+### Non-Blocking Architecture
+- **Immediate startup**: UI loads instantly with clip list from file scan
+- **Background video info**: Video duration and audio track info loaded lazily
+- **Real-time updates**: New files appear immediately via file system monitoring
+- **Performance optimization**: Startup limited to 50 most recent files, manual refresh loads all
 
 ## Development Workflows
 
-### Building & Running
+### Building & Testing
 ```bash
-cargo build --release     # Production build
-RUST_LOG=debug cargo run  # Debug with logging
+cargo check               # Check compilation (preferred for development)
+cargo test                # Run test suite
+cargo build --release     # Production build (only when needed)
+RUST_LOG=debug cargo run  # Debug with logging (Windows: $env:RUST_LOG="debug"; cargo run)
 ```
-
-### FFmpeg Dependencies
-- Requires `ffmpeg` and `ffprobe` in PATH
-- Configured via `AppConfig.ffmpeg_path` or system PATH
-- Commands built dynamically in `video::processor::VideoProcessor`
 
 ### Configuration System
 JSON config stored in `%APPDATA%\clip-helper\config.json`:
 ```json
 {
   "obs_replay_directory": "path/to/replays",
-  "output_directory": "path/to/output",
-  "deleted_directory": "path/to/output/deleted",
-  "trimmed_directory": "path/to/output/trimmed",
   "last_watched_directory": "path/to/last/watched"
 }
 ```
-- Last watched directory is restored on startup; if none exists, no directory is monitored until user selects one
-- Trimmed and deleted directories are created within the watched directory
 
 ## Project-Specific Conventions
 
@@ -105,8 +70,9 @@ JSON config stored in `%APPDATA%\clip-helper\config.json`:
 
 ### Async Architecture
 - Tokio runtime for file monitoring and background tasks
-- `broadcast` channels for hotkey event communication
+- `broadcast` channels for hotkey event communication and file detection
 - GUI runs on main thread, background tasks on Tokio
+- Real-time file monitoring via `notify` crate for immediate updates
 
 ### File Organization
 - Original files never modified
@@ -118,49 +84,7 @@ JSON config stored in `%APPDATA%\clip-helper\config.json`:
 - Unit tests for core data structures, file operations, and timestamp parsing
 - Integration tests for FFmpeg processing and file management workflows
 - Mock file systems for testing file monitoring and organization
-- All major functionality should be testable without requiring actual video files or global hotkeys
-
-## Integration Points
-
-### OBS Integration
-- Monitors replay directory for files matching "Replay YYYY-MM-DD HH-MM-SS.mkv"
-- Hotkey timestamps matched against file creation times within 10-second tolerance
-- Supports OBS replay buffer workflow: record continuously, save on hotkey press
-- Handles multiple replay files and automatic cleanup of old recordings
-
-### Windows-Specific Features
-- Global hotkeys work even when application is not focused
-- Uses Win32 APIs via `global-hotkey` crate for system-wide shortcuts
-- Configuration paths follow Windows standards via `dirs` crate
-- Currently Windows-only due to global hotkey implementation requirements
-
-### Video Processing Pipeline
-- FFmpeg command-line integration for maximum format compatibility
-- Supports complex audio mixing with multiple input tracks
-- Maintains video quality with copy codec (no re-encoding)
-- Handles various OBS output formats (mkv, mp4, etc.)
-
-## User Interface Components
-
-### Main Application Layout
-- **Left Sidebar**: Scrollable clip list with thumbnails and metadata
-- **Central Panel**: Timeline editor with video preview and waveform display
-- **Bottom Panel**: Playback controls, trim adjustments, and action buttons
-- **Top Menu**: Settings, file operations, and application controls
-
-### Timeline Features
-- Horizontal timeline with time markers and current position indicator
-- Draggable trim handles at start and end positions
-- Mouse scrubbing for precise frame-by-frame navigation
-- Audio waveform overlay for visual audio editing
-- Zoom controls for detailed editing of short clips
-
-### Control Buttons Specification
-- **Playback**: Play/pause, go to start, go to last 5 seconds
-- **Navigation**: Skip ±3s, ±5s, ±10s with keyboard shortcuts
-- **Trim Adjustment**: Start/end time ±1s, ±5s buttons
-- **File Operations**: Apply (trim & save), Delete (move to deleted folder)
-- **Audio**: Individual track enable/disable, surround mode toggles
+- Use `cargo test` for running tests, `cargo check` for compilation validation
 
 ## Common Development Tasks
 
@@ -180,39 +104,68 @@ JSON config stored in `%APPDATA%\clip-helper\config.json`:
 - Use egui immediate mode patterns for responsive UI
 - Store persistent state in `ClipHelperApp` struct
 - Separate concerns: timeline, controls, clip list as independent modules
-- Follow egui best practices for layout and interaction
+- **Avoid blocking operations in UI thread**: Use lazy loading and background processing
 
-### Timeline & Preview Features
-- Timeline scrubbing via mouse position mapping to time
-- Draggable trim handles as interactive UI elements
-- Real-time waveform generation using `hound` crate for audio analysis
-- Video frame extraction for preview thumbnails and scrubbing
+### Performance Guidelines
+- **Startup optimization**: Load UI immediately, defer heavy operations
+- **Lazy loading**: Video metadata only loaded when needed (selection or display)
+- **Session-based organization**: Efficient grouping without loading all video data
+- **File monitoring**: Event-driven updates instead of polling
 
-### Audio System Extensions
-- Multi-track audio visualization in timeline
-- Dynamic audio mixing based on user selections
-- Surround sound processing with channel mapping
-- Real-time audio level monitoring during playback
+## Integration Points
 
-## Implementation Status & Next Steps
+### OBS Integration
+- Monitors replay directory for files matching "Replay YYYY-MM-DD HH-MM-SS.mkv"
+- Hotkey timestamps matched against file creation times within 10-second tolerance
+- **Immediate detection**: New files appear in UI instantly when OBS creates them
 
-### Completed Foundation
-- Core data structures and configuration system
-- Basic GUI framework with egui integration
-- FFmpeg command generation for video processing
-- Global hotkey registration system
-- File monitoring and timestamp matching logic
+### Windows-Specific Features
+- Global hotkeys work even when application is not focused
+- Uses Win32 APIs via `global-hotkey` crate for system-wide shortcuts
+- Currently Windows-only due to global hotkey implementation requirements
 
-### In Development
-- Timeline widget with scrubbing capabilities
-- Real-time video preview integration
-- Audio waveform visualization
-- Hotkey event processing (API compatibility fixes needed)
-- File monitoring for new OBS replay files
+### Video Processing Pipeline
+- FFmpeg command-line integration for maximum format compatibility
+- Supports complex audio mixing with multiple input tracks
+- **Lazy loading**: Video information (duration, audio tracks) loaded on-demand
+- **Continuous monitoring**: Files being written by OBS are checked every 2 seconds for completion
+- **Progressive validation**: Invalid files (<1s duration) are rechecked until they become valid
 
-### Future Enhancements
-- Batch processing for multiple clips
-- Export presets and quality settings
-- Keyboard shortcuts for all timeline operations
-- Plugin system for custom processing filters
-- Cross-platform support (Linux, macOS)
+## Implementation Guidelines
+
+### Video Info Lifecycle Management
+- **Initial state**: New clips have no video info (`video_length_seconds: None`)
+- **Gray out phase**: Display clips as grayed out while `needs_video_info_update()` returns true
+- **Periodic updates**: Check grayed-out files every 2 seconds via `update_pending_video_info()`
+- **Validation criteria**: Files with duration >= 1.0 seconds are considered valid
+- **Error handling**: Files that can't be read are marked with 0.0 duration and retried later
+
+### Hotkey Target Duration Assignment
+- **Immediate application**: Hotkeys first try to find existing clips matching the timestamp
+- **Deferred application**: If no existing clip found, store request for future file matching
+- **Resilient matching**: Target duration applies even to grayed-out (invalid) clips
+- **Extended window**: Pending requests remain active for 30 seconds to catch delayed file creation
+
+### UI Responsiveness
+- **Non-blocking operations**: No FFmpeg calls during UI rendering
+- **Immediate feedback**: "Loading..." states shown while processing
+- **Background updates**: Video info populated after UI interaction
+
+### Memory Management
+- **Lazy loading**: Video metadata only loaded when needed
+- **Limited initial scan**: Only recent files loaded at startup
+- **Manual refresh option**: Full scan available on demand
+
+### Code Quality
+- Follow Rust best practices and idioms
+- Use appropriate error handling with `anyhow` and `thiserror`
+- Write unit tests for core functionality
+- Document complex algorithms and design decisions
+
+## File State Management
+- **File validation**: Check for valid video duration (>1s) before displaying as available
+- **Gray out invalid files**: Files being written or with invalid duration should be visually disabled
+- **Target length handling**: Only set target length when explicitly specified via hotkeys
+- **Default state**: New clips should have unspecified target length until hotkey assigns one
+- **Continuous updates**: Files being written by OBS are periodically checked and updated when complete
+- **Hotkey resilience**: Hotkeys work on grayed-out files and apply to files created before detection
