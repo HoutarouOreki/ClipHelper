@@ -39,7 +39,9 @@ impl WaveformData {
         let duration = samples.len() as f64 / spec.sample_rate as f64;
 
         // Clean up temp file
-        let _ = std::fs::remove_file(&temp_path);
+        if let Err(e) = std::fs::remove_file(&temp_path) {
+            log::warn!("Failed to cleanup temporary audio file {}: {}", temp_path.display(), e);
+        }
 
         Ok(WaveformData {
             samples,

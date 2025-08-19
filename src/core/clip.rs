@@ -24,7 +24,7 @@ pub struct AudioTrack {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClipDuration {
     Seconds15 = 15,
     Seconds30 = 30,
