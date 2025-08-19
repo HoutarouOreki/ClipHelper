@@ -5,7 +5,7 @@ use crate::hotkeys::{HotkeyManager, HotkeyEvent};
 use crate::gui::timeline::TimelineWidget;
 use std::collections::HashMap;
 use tokio::sync::broadcast;
-use chrono::Utc;
+use chrono::Local;
 
 #[derive(Debug, Clone)]
 pub struct SessionGroup {
@@ -13,6 +13,15 @@ pub struct SessionGroup {
     pub start_time: String, // "14:56"
     pub end_time: String, // "17:11"
     pub clips: Vec<usize>, // indices into the main clips vector
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingClipRequest {
+    pub timestamp: chrono::DateTime<Local>,
+    pub duration: crate::core::ClipDuration,
+    pub created_at: std::time::Instant,
+    pub last_retry: std::time::Instant,
+    pub retry_count: u32,
 }
 
 pub struct ClipHelperApp {
@@ -25,7 +34,7 @@ pub struct ClipHelperApp {
     pub file_monitor: Option<FileMonitor>,
     pub file_receiver: Option<broadcast::Receiver<NewReplayFile>>,
     pub new_clip_name: String,
-    pub pending_clip_requests: Vec<(chrono::DateTime<Utc>, crate::core::ClipDuration)>,
+    pub pending_clip_requests: Vec<PendingClipRequest>,
     pub watched_directory: Option<std::path::PathBuf>,
     pub show_directory_dialog: bool,
     pub status_message: String,
@@ -34,10 +43,17 @@ pub struct ClipHelperApp {
     pub show_drives_view: bool,
     /// Last time we checked for video info updates (for clips that might still be writing)
     pub last_video_info_check: std::time::Instant,
+    /// Whether we've done the initial file scan yet
+    pub initial_scan_completed: bool,
 }
 
 impl ClipHelperApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
+        // Set global text color to white
+        let mut visuals = egui::Visuals::dark();
+        visuals.override_text_color = Some(egui::Color32::WHITE);
+        cc.egui_ctx.set_visuals(visuals);
+        
         let config = AppConfig::load()?;
         config.ensure_directories()?;
 
@@ -85,29 +101,8 @@ impl ClipHelperApp {
         };
 
         // Load existing clips from the watched directory (without blocking on video info)
-        let mut clips = Vec::new();
-        if let Some(ref dir) = watched_directory {
-            log::info!("Loading existing clips from {}", dir.display());
-            match FileMonitor::scan_existing_files(dir) {
-                Ok(existing_files) => {
-                    log::info!("Found {} existing replay files, loading most recent 50 for startup", existing_files.len());
-                    for file in existing_files.into_iter().take(50) {
-                        match Clip::new_without_target(file.path) {
-                            Ok(clip) => {
-                                // Don't populate video info at startup - let it load in background
-                                clips.push(clip);
-                            }
-                            Err(e) => {
-                                log::error!("Failed to create clip from existing file: {}", e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to scan existing files: {}", e);
-                }
-            }
-        }
+        let clips = Vec::new();
+        // Note: File scanning moved to background - UI shows immediately
 
         Ok(Self {
             config,
@@ -127,6 +122,7 @@ impl ClipHelperApp {
             timeline_widget: TimelineWidget::new(),
             show_drives_view: false,
             last_video_info_check: std::time::Instant::now(),
+            initial_scan_completed: false,
         })
     }
 
@@ -215,15 +211,17 @@ impl ClipHelperApp {
         while let Ok(event) = self.hotkey_receiver.try_recv() {
             match event {
                 HotkeyEvent::ClipRequested(duration) => {
-                    let now = Utc::now();
+                    let now = Local::now();
                     log::info!("Hotkey triggered for {:?} at {}", duration, now);
                     
                     // First, try to find existing clips that match this timestamp
                     // This includes clips that might be grayed out (still being written)
                     let mut found_existing = false;
-                    for clip in &mut self.clips {
+                    log::debug!("Looking for clips matching timestamp: {}", now);
+                    log::debug!("Current clips: {}", self.clips.len());
+                    
+                    for clip in self.clips.iter_mut() {
                         if clip.matches_timestamp(now) {
-                            log::info!("Setting target duration for existing clip: {}", clip.get_output_filename());
                             clip.set_target_duration(duration.clone());
                             found_existing = true;
                             
@@ -250,7 +248,14 @@ impl ClipHelperApp {
                     // 1. User presses hotkey
                     // 2. OBS hasn't created the file yet (or file hasn't been detected)
                     // 3. File appears later and should still get the target duration applied
-                    self.pending_clip_requests.push((now, duration.clone()));
+                    let now_instant = std::time::Instant::now();
+                    self.pending_clip_requests.push(PendingClipRequest {
+                        timestamp: now,
+                        duration: duration.clone(),
+                        created_at: now_instant,
+                        last_retry: now_instant,
+                        retry_count: 0,
+                    });
                     
                     // If no existing clip matched, try to match with recent files
                     if !found_existing {
@@ -276,9 +281,9 @@ impl ClipHelperApp {
             // First, check if this file matches any pending clip requests
             let mut matched_requests = Vec::new();
             
-            for (i, (request_time, duration)) in self.pending_clip_requests.iter().enumerate() {
-                if Self::timestamps_match_static(*request_time, new_file.timestamp) {
-                    matched_requests.push((i, new_file.clone(), duration.clone()));
+            for (i, request) in self.pending_clip_requests.iter().enumerate() {
+                if Self::timestamps_match_static(request.timestamp, new_file.timestamp) {
+                    matched_requests.push((i, new_file.clone(), request.duration.clone()));
                 }
             }
             
@@ -290,13 +295,12 @@ impl ClipHelperApp {
             
             // If no hotkey request matched, still add the file to the clip list automatically
             if matched_requests.is_empty() {
-                log::info!("Auto-adding new replay file to clip list: {:?}", new_file.path);
                 self.create_clip_from_file(new_file, None);
             }
         }
     }
     
-    fn try_match_clip_request(&mut self, request_time: chrono::DateTime<Utc>, duration: crate::core::ClipDuration) {
+    fn try_match_clip_request(&mut self, request_time: chrono::DateTime<Local>, duration: crate::core::ClipDuration) {
         if let Some(ref watched_dir) = self.watched_directory {
             // Scan for existing files that might match
             if let Ok(existing_files) = FileMonitor::scan_existing_files(watched_dir) {
@@ -304,7 +308,7 @@ impl ClipHelperApp {
                     if self.timestamps_match(request_time, file.timestamp) {
                         self.create_clip_from_file(file, Some(duration));
                         // Remove the pending request
-                        self.pending_clip_requests.retain(|(time, _)| *time != request_time);
+                        self.pending_clip_requests.retain(|req| req.timestamp != request_time);
                         return;
                     }
                 }
@@ -313,17 +317,17 @@ impl ClipHelperApp {
         
         // Keep the request pending for a bit in case the file appears later
         // Remove old pending requests (older than 30 seconds)
-        let cutoff = Utc::now() - chrono::Duration::seconds(30);
-        self.pending_clip_requests.retain(|(time, _)| *time > cutoff);
+        let cutoff = Local::now() - chrono::Duration::seconds(30);
+        self.pending_clip_requests.retain(|req| req.timestamp > cutoff);
     }
     
     fn try_match_file_to_requests(&mut self, new_file: &NewReplayFile) {
         let mut clips_to_create = Vec::new();
         let mut indices_to_remove = Vec::new();
         
-        for (i, (request_time, duration)) in self.pending_clip_requests.iter().enumerate() {
-            if Self::timestamps_match_static(*request_time, new_file.timestamp) {
-                clips_to_create.push((new_file.clone(), duration.clone()));
+        for (i, request) in self.pending_clip_requests.iter().enumerate() {
+            if Self::timestamps_match_static(request.timestamp, new_file.timestamp) {
+                clips_to_create.push((new_file.clone(), request.duration.clone()));
                 indices_to_remove.push(i);
             }
         }
@@ -339,11 +343,11 @@ impl ClipHelperApp {
         }
     }
     
-    fn timestamps_match(&self, request_time: chrono::DateTime<Utc>, file_time: chrono::DateTime<Utc>) -> bool {
+    fn timestamps_match(&self, request_time: chrono::DateTime<Local>, file_time: chrono::DateTime<Local>) -> bool {
         Self::timestamps_match_static(request_time, file_time)
     }
     
-    fn timestamps_match_static(request_time: chrono::DateTime<Utc>, file_time: chrono::DateTime<Utc>) -> bool {
+    fn timestamps_match_static(request_time: chrono::DateTime<Local>, file_time: chrono::DateTime<Local>) -> bool {
         let diff = (request_time - file_time).num_seconds().abs();
         diff <= 10 // Within 10 seconds
     }
@@ -426,8 +430,8 @@ impl ClipHelperApp {
 
         let mut sessions = Vec::new();
         let mut current_session_clips = Vec::new();
-        let mut session_start_time: Option<chrono::DateTime<Utc>> = None;
-        let mut last_clip_time: Option<chrono::DateTime<Utc>> = None;
+        let mut session_start_time: Option<chrono::DateTime<Local>> = None;
+        let mut last_clip_time: Option<chrono::DateTime<Local>> = None;
 
         // Sort clips by timestamp
         let mut sorted_indices: Vec<usize> = (0..self.clips.len()).collect();
@@ -545,12 +549,105 @@ impl ClipHelperApp {
             }
         }
     }
+    
+    fn process_pending_clip_retries(&mut self) {
+        let now = std::time::Instant::now();
+        let mut requests_to_remove = Vec::new();
+        let mut clips_to_update = Vec::new();
+        let mut files_to_create = Vec::new();
+        
+        for (i, request) in self.pending_clip_requests.iter_mut().enumerate() {
+            // Check if it's time to retry (every 1 second)
+            if now.duration_since(request.last_retry).as_secs() >= 1 {
+                request.last_retry = now;
+                request.retry_count += 1;
+                
+                // Check if we've exceeded 10 seconds (10 retries)
+                if now.duration_since(request.created_at).as_secs() >= 10 {
+                    requests_to_remove.push(i);
+                    continue;
+                }
+                
+                // Try to find a matching clip again
+                let mut found_existing = false;
+                for (clip_index, clip) in self.clips.iter().enumerate() {
+                    if clip.matches_timestamp(request.timestamp) {
+                        clips_to_update.push((clip_index, request.duration.clone()));
+                        found_existing = true;
+                        requests_to_remove.push(i);
+                        break;
+                    }
+                }
+                
+                // If still no match, check for new files
+                if !found_existing {
+                    if let Some(ref watched_dir) = self.watched_directory {
+                        if let Ok(existing_files) = FileMonitor::scan_existing_files(watched_dir) {
+                            for file in existing_files {
+                                if Self::timestamps_match_static(request.timestamp, file.timestamp) {
+                                    files_to_create.push((file, request.duration.clone()));
+                                    requests_to_remove.push(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Apply updates outside the iteration to avoid borrow conflicts
+        for (clip_index, duration) in clips_to_update {
+            if let Some(clip) = self.clips.get_mut(clip_index) {
+                clip.set_target_duration(duration);
+            }
+        }
+        
+        for (file, duration) in files_to_create {
+            self.create_clip_from_file(file, Some(duration));
+        }
+        
+        // Remove completed or expired requests (in reverse order to maintain indices)
+        for &index in requests_to_remove.iter().rev() {
+            self.pending_clip_requests.remove(index);
+        }
+    }
+    
+    fn perform_initial_scan(&mut self) {
+        if !self.initial_scan_completed {
+            if let Some(ref dir) = self.watched_directory.clone() {
+                log::info!("Performing initial file scan of {}", dir.display());
+                match FileMonitor::scan_existing_files(dir) {
+                    Ok(existing_files) => {
+                        log::info!("Found {} existing replay files, loading most recent 50", existing_files.len());
+                        for file in existing_files.into_iter().take(50) {
+                            match Clip::new_without_target(file.path) {
+                                Ok(clip) => {
+                                    self.clips.push(clip);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to create clip from existing file: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to scan existing files: {}", e);
+                    }
+                }
+            }
+            self.initial_scan_completed = true;
+        }
+    }
 
 
 }
 
 impl eframe::App for ClipHelperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Perform initial file scan if not done yet (non-blocking after UI is shown)
+        self.perform_initial_scan();
+        
         // Process events
         self.process_hotkey_events();
         self.process_file_events();
@@ -558,9 +655,12 @@ impl eframe::App for ClipHelperApp {
         // Update video info for clips that might still be writing
         self.update_pending_video_info();
         
+        // Check for pending clip request retries
+        self.process_pending_clip_retries();
+        
         // Periodic cleanup of old clip requests
-        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(30);
-        self.pending_clip_requests.retain(|(time, _)| *time > cutoff);
+        let cutoff = chrono::Local::now() - chrono::Duration::seconds(30);
+        self.pending_clip_requests.retain(|req| req.timestamp > cutoff);
         
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -674,19 +774,6 @@ impl ClipHelperApp {
         
         ui.separator();
         
-        // Button to scan for existing files
-        ui.horizontal(|ui| {
-            if ui.button("🔄 Scan for Replay Files").clicked() {
-                self.scan_and_load_replay_files();
-            }
-            
-            if ui.button("♻️ Refresh").clicked() {
-                self.force_refresh_clips();
-            }
-        });
-        
-        ui.separator();
-        
         // Show clips grouped by sessions
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -713,20 +800,40 @@ impl ClipHelperApp {
                                     let is_selected = selected_index == Some(clip_index);
                                     let is_valid = clip.is_video_valid();
                                     
-                                    // Gray out invalid files
-                                    let text_color = if is_valid {
-                                        ui.visuals().text_color()
-                                    } else {
-                                        ui.visuals().weak_text_color()
-                                    };
+                                    // Make the entire container clickable and take full width
+                                    let container_rect = egui::Rect::from_min_size(
+                                        ui.cursor().min,
+                                        egui::Vec2::new(ui.available_width(), 10.0 + ui.text_style_height(&egui::TextStyle::Body) * 3.0)
+                                    );
                                     
-                                    ui.group(|ui| {
+                                    // Draw the container background FIRST (before content)
+                                    if is_selected {
+                                        ui.painter().rect_filled(container_rect, 4.0, ui.visuals().selection.bg_fill);
+                                    } else if container_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
+                                        // Use a more subtle hover background - lighter version of selection color
+                                        let mut hover_color = ui.visuals().selection.bg_fill;
+                                        hover_color[3] = (hover_color[3] as f32 * 0.3) as u8; // Make it 30% opacity
+                                        ui.painter().rect_filled(container_rect, 4.0, hover_color);
+                                    }
+                                    
+                                    // Draw border only for selected items
+                                    if is_selected {
+                                        ui.painter().rect_stroke(container_rect, 4.0, ui.visuals().selection.stroke);
+                                    }
+                                    
+                                    // Content area inside the container with 5px padding
+                                    let content_rect = container_rect.shrink(5.0);
+                                    
+                                    // Create the content inside the container
+                                    ui.allocate_ui_at_rect(content_rect, |ui| {
                                         ui.scope(|ui| {
-                                            ui.visuals_mut().override_text_color = Some(text_color);
-                                            
-                                            if ui.selectable_label(is_selected, &clip.get_output_filename()).clicked() && is_valid {
-                                                selected_index = Some(clip_index);
+                                            // Override text color for invalid files only
+                                            if !is_valid {
+                                                ui.visuals_mut().override_text_color = Some(egui::Color32::GRAY);
                                             }
+                                            
+                                            // Filename
+                                            ui.label(&clip.get_output_filename());
                                             
                                             // Show video length and target duration on separate lines
                                             if let Some(video_length) = clip.video_length_seconds {
@@ -749,6 +856,16 @@ impl ClipHelperApp {
                                             }
                                         });
                                     });
+                                    
+                                    // Create an interactive layer over the entire container for clicks
+                                    let container_response = ui.interact(container_rect, egui::Id::new(format!("clip_container_{}", clip_index)), egui::Sense::click());
+                                    
+                                    if container_response.clicked() && is_valid {
+                                        selected_index = Some(clip_index);
+                                    }
+                                    
+                                    // Advance cursor past the container (no double allocation)
+                                    ui.advance_cursor_after_rect(container_rect);
                                     
                                     ui.add_space(4.0);
                                 }

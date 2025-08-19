@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use tokio::sync::broadcast;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 
 #[derive(Debug, Clone)]
 pub struct NewReplayFile {
     pub path: PathBuf,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: DateTime<Local>,
 }
 
 pub struct FileMonitor {

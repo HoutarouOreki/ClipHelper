@@ -14,7 +14,7 @@ A Rust application designed to help streamline the process of trimming and organ
 - **Timeline Editor**: Visual timeline with scrubbing controls for precise trimming
 - **Video Preview**: Built-in video player with playback controls
 - **Audio Track Management**: Enable/disable tracks and configure surround sound options
-- **Non-blocking Startup**: UI loads immediately, video info loads in background
+- **Non-blocking Startup**: UI appears instantly, file scanning and video info load in background
 
 ### Enhanced User Interface
 - **300px wide sidebar** with full-width scrollable clip list
@@ -158,7 +158,26 @@ src/
 
 ### Building
 ```bash
-# Debug build
+# ## Debug
+
+### Logging
+```bash
+# Enable debug logging to see detailed timestamp matching
+RUST_LOG=debug cargo run
+
+# Info level for general application flow
+RUST_LOG=info cargo run
+
+# See hotkey processing and file matching
+RUST_LOG=clip_helper=debug cargo run
+```
+
+### Timezone Handling
+- All timestamps use **local time** (not UTC) for accurate matching
+- OBS replay file timestamps: Parsed as local time from filename
+- Hotkey timestamps: Recorded in local time when pressed
+- Matching window: 10-second tolerance accounts for timing differences
+- **Note**: No timezone conversion is performed - both hotkeys and files should be in the same local timezone build
 cargo build
 
 # Release build
