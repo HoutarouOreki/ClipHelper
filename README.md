@@ -8,7 +8,8 @@ A Rust application designed to help streamline the process of trimming and organ
 
 ### Core Functionality
 - **Global Hotkeys**: Capture clips with Ctrl+Numpad1-5 for different durations (15s, 30s, 1m, 2m, 5m)
-- **Smart File Matching**: Automatically matches timestamps to replay files within a 10-second window
+- **Smart Duration Matching**: Persistent duration request system allows multiple duration changes within 10-second window
+- **Latest Request Wins**: Most recent hotkey press always takes precedence for duration assignment
 - **Real-time Auto-detection**: New replay files automatically appear in clip list immediately
 - **Session Grouping**: Clips organized by recording sessions (gaps > 1 hour create new sessions)
 - **Timeline Editor**: Visual timeline with scrubbing controls for precise trimming
@@ -85,7 +86,9 @@ cargo build --release
 2. **Capturing Clips**:
    - While OBS is recording with replay buffer enabled
    - Press `Ctrl+1` through `Ctrl+5` when something interesting happens
-   - The application will automatically find the matching replay file
+   - Duration requests are saved with timestamps for later matching
+   - Multiple hotkey presses within 10 seconds will update the same clip (latest wins)
+   - The application will automatically find matching replay files and apply durations
 
 3. **Editing Clips**:
    - Select a clip from the list on the left
@@ -214,6 +217,8 @@ cargo test test_name
 
 The application stores configuration in:
 - Windows: `%APPDATA%\clip-helper\config.json`
+- Duration requests: `%APPDATA%\clip-helper\duration_requests.json`  
+- Clip persistence: `%APPDATA%\clip-helper\clips.json`
 
 Example configuration:
 ```json

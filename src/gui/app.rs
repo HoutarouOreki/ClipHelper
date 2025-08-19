@@ -6,6 +6,13 @@ use crate::gui::timeline::TimelineWidget;
 use std::collections::HashMap;
 use tokio::sync::broadcast;
 use chrono::Local;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurationRequest {
+    pub timestamp: chrono::DateTime<Local>,
+    pub duration: crate::core::ClipDuration,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionGroup {
@@ -35,6 +42,7 @@ pub struct ClipHelperApp {
     pub file_receiver: Option<broadcast::Receiver<NewReplayFile>>,
     pub new_clip_name: String,
     pub pending_clip_requests: Vec<PendingClipRequest>,
+    pub duration_requests: Vec<DurationRequest>,
     pub watched_directory: Option<std::path::PathBuf>,
     pub show_directory_dialog: bool,
     pub status_message: String,
@@ -104,7 +112,7 @@ impl ClipHelperApp {
         let clips = Vec::new();
         // Note: File scanning moved to background - UI shows immediately
 
-        Ok(Self {
+        let mut app = Self {
             config,
             clips,
             selected_clip_index: None,
@@ -115,6 +123,7 @@ impl ClipHelperApp {
             file_receiver,
             new_clip_name: String::new(),
             pending_clip_requests: Vec::new(),
+            duration_requests: Vec::new(),
             watched_directory,
             show_directory_dialog: false,
             status_message: String::new(),
@@ -123,7 +132,11 @@ impl ClipHelperApp {
             show_drives_view: false,
             last_video_info_check: std::time::Instant::now(),
             initial_scan_completed: false,
-        })
+        };
+
+        // Don't load saved clips here - we'll apply saved config after scanning files
+        
+        Ok(app)
     }
 
     pub fn add_clip(&mut self, clip: Clip) {
@@ -214,53 +227,22 @@ impl ClipHelperApp {
                     let now = Local::now();
                     log::info!("Hotkey triggered for {:?} at {}", duration, now);
                     
-                    // First, try to find existing clips that match this timestamp
-                    // This includes clips that might be grayed out (still being written)
-                    let mut found_existing = false;
-                    log::debug!("Looking for clips matching timestamp: {}", now);
-                    log::debug!("Current clips: {}", self.clips.len());
-                    
-                    for clip in self.clips.iter_mut() {
-                        if clip.matches_timestamp(now) {
-                            clip.set_target_duration(duration.clone());
-                            found_existing = true;
-                            
-                            // If the clip needs video info update, try to update it now
-                            if clip.needs_video_info_update() {
-                                match clip.populate_video_info() {
-                                    Ok(is_valid) => {
-                                        if is_valid {
-                                            log::info!("Video info updated after setting target duration for {}", clip.get_output_filename());
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // File might still be writing, will be updated later
-                                    }
-                                }
-                            }
-                            break; // Only update the first matching clip
-                        }
-                    }
-                    
-                    // Always store the clip request for future file matching, even if we found existing clips
-                    // This ensures that if OBS creates a new file shortly after the hotkey,
-                    // it will get the correct target duration. This handles the case where:
-                    // 1. User presses hotkey
-                    // 2. OBS hasn't created the file yet (or file hasn't been detected)
-                    // 3. File appears later and should still get the target duration applied
-                    let now_instant = std::time::Instant::now();
-                    self.pending_clip_requests.push(PendingClipRequest {
+                    // Simply save the duration request - matching will happen at display time
+                    self.duration_requests.push(DurationRequest {
                         timestamp: now,
                         duration: duration.clone(),
-                        created_at: now_instant,
-                        last_retry: now_instant,
-                        retry_count: 0,
                     });
                     
-                    // If no existing clip matched, try to match with recent files
-                    if !found_existing {
-                        self.try_match_clip_request(now, duration);
+                    // Clean up old duration requests (older than 1 hour)
+                    let cutoff = now - chrono::Duration::hours(1);
+                    self.duration_requests.retain(|req| req.timestamp > cutoff);
+                    
+                    // Save duration requests to persistence
+                    if let Err(e) = self.save_duration_requests() {
+                        log::error!("Failed to save duration requests: {}", e);
                     }
+                    
+                    log::info!("Saved duration request for {} at {}", duration as u32, now);
                 }
             }
         }
@@ -352,20 +334,26 @@ impl ClipHelperApp {
         diff <= 10 // Within 10 seconds
     }
     
-    fn create_clip_from_file(&mut self, file: NewReplayFile, duration: Option<crate::core::ClipDuration>) {
-        let clip_result = if let Some(duration) = duration {
-            // Create clip with specific target duration (from hotkey)
-            Clip::new(file.path, duration)
-        } else {
-            // Create clip without target duration (auto-detected file)
-            Clip::new_without_target(file.path)
-        };
+    fn create_clip_from_file(&mut self, file: NewReplayFile, _duration: Option<crate::core::ClipDuration>) {
+        // Check if a clip with this file path already exists
+        if self.clips.iter().any(|existing_clip| existing_clip.original_file == file.path) {
+            log::debug!("Clip already exists for file: {:?}", file.path);
+            return;
+        }
+
+        // Always create clips without target duration - matching will happen at display time
+        let clip_result = Clip::new_without_target(file.path);
         
         match clip_result {
             Ok(clip) => {
                 // Don't block on video info - load it lazily when needed
                 log::info!("Created clip: {}", clip.get_output_filename());
                 self.clips.push(clip);
+                
+                // Save clips after adding new clip
+                if let Err(e) = self.save_clips() {
+                    log::error!("Failed to save clips after creating new clip: {}", e);
+                }
             }
             Err(e) => {
                 log::error!("Failed to create clip: {}", e);
@@ -409,6 +397,11 @@ impl ClipHelperApp {
                         }
                         
                         self.status_message = format!("Refreshed {} clips", self.clips.len());
+                        
+                        // Save clips after force refresh
+                        if let Err(e) = self.save_clips() {
+                            log::error!("Failed to save clips after force refresh: {}", e);
+                        }
                     } else {
                         self.status_message = "No replay files found".to_string();
                     }
@@ -600,6 +593,10 @@ impl ClipHelperApp {
         for (clip_index, duration) in clips_to_update {
             if let Some(clip) = self.clips.get_mut(clip_index) {
                 clip.set_target_duration(duration);
+                // Save clips after setting target duration
+                if let Err(e) = self.save_clips() {
+                    log::error!("Failed to save clips after setting target duration: {}", e);
+                }
             }
         }
         
@@ -615,11 +612,22 @@ impl ClipHelperApp {
     
     fn perform_initial_scan(&mut self) {
         if !self.initial_scan_completed {
+            // Load duration requests first
+            if let Err(e) = self.load_duration_requests() {
+                log::error!("Failed to load duration requests: {}", e);
+            }
+            
             if let Some(ref dir) = self.watched_directory.clone() {
                 log::info!("Performing initial file scan of {}", dir.display());
+                
+                // Clear any existing clips first
+                self.clips.clear();
+                
                 match FileMonitor::scan_existing_files(dir) {
                     Ok(existing_files) => {
                         log::info!("Found {} existing replay files, loading most recent 50", existing_files.len());
+                        
+                        // Create clips from actual files
                         for file in existing_files.into_iter().take(50) {
                             match Clip::new_without_target(file.path) {
                                 Ok(clip) => {
@@ -630,6 +638,9 @@ impl ClipHelperApp {
                                 }
                             }
                         }
+                        
+                        // Now apply saved configurations to matching clips
+                        self.apply_saved_configurations();
                     }
                     Err(e) => {
                         log::error!("Failed to scan existing files: {}", e);
@@ -637,6 +648,50 @@ impl ClipHelperApp {
                 }
             }
             self.initial_scan_completed = true;
+        }
+    }
+
+    fn apply_saved_configurations(&mut self) {
+        let clips_path = Self::clips_file_path();
+        if clips_path.exists() {
+            match std::fs::read_to_string(&clips_path) {
+                Ok(content) => {
+                    match serde_json::from_str::<Vec<Clip>>(&content) {
+                        Ok(saved_clips) => {
+                            log::info!("Applying saved configurations for {} clips", saved_clips.len());
+                            
+                            // For each current clip, find matching saved clip and apply configuration
+                            for current_clip in &mut self.clips {
+                                for saved_clip in &saved_clips {
+                                    // Match by original file path
+                                    if current_clip.original_file == saved_clip.original_file {
+                                        if saved_clip.has_target_duration() {
+                                            current_clip.duration_seconds = saved_clip.duration_seconds;
+                                            current_clip.trim_start = saved_clip.trim_start;
+                                            current_clip.trim_end = saved_clip.trim_end;
+                                            log::debug!("Applied saved target duration {} to {}", 
+                                                saved_clip.duration_seconds, current_clip.get_output_filename());
+                                        }
+                                        current_clip.name = saved_clip.name.clone();
+                                        current_clip.audio_tracks = saved_clip.audio_tracks.clone();
+                                        current_clip.is_deleted = saved_clip.is_deleted;
+                                        current_clip.is_trimmed = saved_clip.is_trimmed;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse saved clips file: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to read saved clips file: {}", e);
+                }
+            }
+        } else {
+            log::debug!("No saved clips file found, starting fresh");
         }
     }
 
@@ -778,6 +833,9 @@ impl ClipHelperApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let mut clips_needing_info = Vec::new();
+                let mut clips_needing_duration_update = Vec::new();
+                
                 if self.clips.is_empty() {
                     ui.label("No clips loaded");
                     ui.small("Press the scan button above to load existing replay files");
@@ -785,7 +843,6 @@ impl ClipHelperApp {
                 } else {
                     let sessions = self.group_clips_into_sessions();
                     let mut selected_index = self.selected_clip_index;
-                    let mut clips_needing_info = Vec::new();
                     
                     for session in sessions {
                         // Session header
@@ -838,18 +895,25 @@ impl ClipHelperApp {
                                             // Show video length and target duration on separate lines
                                             if let Some(video_length) = clip.video_length_seconds {
                                                 if video_length >= 1.0 {
-                                                    ui.small(format!("Video: {}", Clip::format_duration(video_length)));
+                                                    ui.small(format!("Original: {}", Clip::format_duration(video_length)));
                                                 } else {
-                                                    ui.small("Video: Invalid (<1s)");
+                                                    ui.small("Waiting...");
                                                 }
                                             } else {
-                                                ui.small("Video: Loading...");
+                                                ui.small("Waiting...");
                                                 // Mark for background loading
                                                 clips_needing_info.push(clip_index);
                                             }
                                             
-                                            // Show target duration only if set
-                                            if clip.has_target_duration() {
+                                            // Show target duration - check for newer duration requests first
+                                            if let Some(matching_request) = self.find_matching_duration_request(clip) {
+                                                // Found a matching duration request - show it and mark for update if different
+                                                ui.small(format!("Target: {}", Clip::format_duration(matching_request.duration as u32 as f64)));
+                                                // Only update if the duration is different from current
+                                                if !clip.has_target_duration() || clip.duration_seconds != matching_request.duration as u32 {
+                                                    clips_needing_duration_update.push((clip_index, matching_request.duration, matching_request.timestamp));
+                                                }
+                                            } else if clip.has_target_duration() {
                                                 ui.small(format!("Target: {}", Clip::format_duration(clip.duration_seconds as f64)));
                                             } else {
                                                 ui.small("Target: Not set");
@@ -881,10 +945,30 @@ impl ClipHelperApp {
                             self.select_clip(index);
                         }
                     }
+                }
+                
+                // Load video info for clips that need it (after UI to avoid borrowing issues)
+                for clip_index in clips_needing_info {
+                    self.ensure_video_info_loaded(clip_index);
+                }
+                
+                // Apply duration updates for clips that matched duration requests
+                let duration_updates_applied = !clips_needing_duration_update.is_empty();
+                for (clip_index, duration, _request_timestamp) in clips_needing_duration_update {
+                    self.clips[clip_index].set_target_duration(duration);
+                    // Don't remove the duration request yet - allow multiple updates
+                    // We'll clean up old requests periodically instead
                     
-                    // Load video info for clips that need it (after UI to avoid borrowing issues)
-                    for clip_index in clips_needing_info {
-                        self.ensure_video_info_loaded(clip_index);
+                    log::info!("Applied duration request {} to clip {}", duration as u32, self.clips[clip_index].get_output_filename());
+                }
+                
+                // Save changes if any duration updates were applied
+                if duration_updates_applied {
+                    if let Err(e) = self.save_clips() {
+                        log::error!("Failed to save clips after applying duration requests: {}", e);
+                    }
+                    if let Err(e) = self.save_duration_requests() {
+                        log::error!("Failed to save duration requests after applying: {}", e);
                     }
                 }
             });
@@ -919,6 +1003,11 @@ impl ClipHelperApp {
                     
                     self.status_message = format!("Loaded {} replay files", self.clips.len());
                     log::info!("Successfully loaded {} clips from existing files", self.clips.len());
+                    
+                    // Save clips after loading from files
+                    if let Err(e) = self.save_clips() {
+                        log::error!("Failed to save clips after loading from files: {}", e);
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to scan existing files: {}", e);
@@ -1281,6 +1370,124 @@ impl ClipHelperApp {
             Err(e) => {
                 log::error!("Failed to start file monitoring: {}", e);
                 self.status_message = format!("Failed to monitor directory: {}", e);
+            }
+        }
+    }
+
+    fn clips_file_path() -> std::path::PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("clip-helper")
+            .join("clips.json")
+    }
+
+    fn save_clips(&self) -> anyhow::Result<()> {
+        let clips_path = Self::clips_file_path();
+        if let Some(parent) = clips_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(&self.clips)?;
+        std::fs::write(&clips_path, content)?;
+        log::debug!("Saved {} clips to {}", self.clips.len(), clips_path.display());
+        Ok(())
+    }
+
+    fn save_duration_requests(&self) -> anyhow::Result<()> {
+        let requests_path = Self::duration_requests_file_path();
+        if let Some(parent) = requests_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(&self.duration_requests)?;
+        std::fs::write(&requests_path, content)?;
+        log::debug!("Saved {} duration requests to {}", self.duration_requests.len(), requests_path.display());
+        Ok(())
+    }
+
+    fn duration_requests_file_path() -> std::path::PathBuf {
+        let mut path = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        path.push("clip-helper");
+        path.push("duration_requests.json");
+        path
+    }
+
+    fn load_duration_requests(&mut self) -> anyhow::Result<()> {
+        let requests_path = Self::duration_requests_file_path();
+        if requests_path.exists() {
+            let content = std::fs::read_to_string(&requests_path)?;
+            match serde_json::from_str::<Vec<DurationRequest>>(&content) {
+                Ok(requests) => {
+                    log::info!("Loaded {} duration requests from {}", requests.len(), requests_path.display());
+                    self.duration_requests = requests;
+                    
+                    // Clean up old requests (older than 1 hour)
+                    let cutoff = Local::now() - chrono::Duration::hours(1);
+                    let original_count = self.duration_requests.len();
+                    self.duration_requests.retain(|req| req.timestamp > cutoff);
+                    let cleaned_count = self.duration_requests.len();
+                    
+                    if cleaned_count < original_count {
+                        log::info!("Cleaned {} old duration requests", original_count - cleaned_count);
+                        // Save the cleaned list
+                        let _ = self.save_duration_requests();
+                    }
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse duration requests file ({}), starting with empty list", e);
+                    self.duration_requests.clear();
+                    Ok(())
+                }
+            }
+        } else {
+            log::debug!("No duration requests file found at {}", requests_path.display());
+            Ok(())
+        }
+    }
+
+    /// Find the best matching duration request for a clip based on timestamp
+    fn find_matching_duration_request(&self, clip: &Clip) -> Option<&DurationRequest> {
+        let clip_timestamp = clip.timestamp;
+        
+        // Find the LATEST (most recent) duration request that was made after the clip timestamp
+        // This allows multiple keybind presses to override previous ones
+        self.duration_requests
+            .iter()
+            .filter(|req| {
+                let diff = (req.timestamp - clip_timestamp).num_seconds();
+                // Request must be after clip creation and within 10 seconds
+                diff >= 0 && diff <= 10
+            })
+            .max_by_key(|req| req.timestamp) // Get the LATEST request, not the closest
+    }
+
+    fn load_clips(&mut self) -> anyhow::Result<()> {
+        let clips_path = Self::clips_file_path();
+        if clips_path.exists() {
+            let content = std::fs::read_to_string(&clips_path)?;
+            match serde_json::from_str::<Vec<Clip>>(&content) {
+                Ok(clips) => {
+                    log::info!("Loaded {} clips from {}", clips.len(), clips_path.display());
+                    self.clips = clips;
+                    Ok(())
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse clips file ({}), starting with empty list", e);
+                    self.clips.clear();
+                    Ok(())
+                }
+            }
+        } else {
+            log::debug!("No clips file found at {}", clips_path.display());
+            Ok(())
+        }
+    }
+
+    fn set_target_duration_and_save(&mut self, clip_index: usize, duration: crate::core::ClipDuration) {
+        if let Some(clip) = self.clips.get_mut(clip_index) {
+            clip.set_target_duration(duration);
+            if let Err(e) = self.save_clips() {
+                log::error!("Failed to save clips after setting target duration: {}", e);
             }
         }
     }

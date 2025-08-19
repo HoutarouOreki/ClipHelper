@@ -11,12 +11,21 @@ ClipHelper is a Rust application for trimming OBS replay buffer clips with globa
 
 ## Key Design Patterns
 
-### Timestamp Matching System
-Clips match OBS replay files within 10-second windows using filename parsing:
+### Duration Request System
+Duration assignment uses a persistence-based approach for maximum reliability:
 ```rust
-// Extract from "Replay 2025-08-17 21-52-01.mkv" format
-pub fn extract_timestamp_from_filename(file: &PathBuf) -> anyhow::Result<DateTime<Utc>>
+// Duration requests saved with timestamps when hotkeys pressed
+pub struct DurationRequest {
+    pub timestamp: DateTime<Local>,
+    pub duration: ClipDuration,
+}
 ```
+
+### Timestamp Matching Logic
+- **Latest Request Wins**: `find_matching_duration_request()` uses `max_by_key(timestamp)` for most recent
+- **Direction-aware**: Only clips created BEFORE hotkey press can be matched (`request.timestamp >= clip.timestamp`)
+- **Multiple changes**: Users can press different hotkeys within 10-second window to change duration
+- **Display-time application**: Duration matching happens during UI rendering, then permanently applied
 
 ### Session Grouping Algorithm
 Clips are automatically grouped into recording sessions:
@@ -116,8 +125,10 @@ JSON config stored in `%APPDATA%\clip-helper\config.json`:
 
 ### OBS Integration
 - Monitors replay directory for files matching "Replay YYYY-MM-DD HH-MM-SS.mkv"
-- Hotkey timestamps matched against file creation times within 10-second tolerance
+- Duration requests persisted to `%APPDATA%\clip-helper\duration_requests.json`
 - **Immediate detection**: New files appear in UI instantly when OBS creates them
+- **Retroactive matching**: Duration requests applied when matching files are found
+- **Multiple duration changes**: Latest hotkey within 10-second window takes precedence
 
 ### Windows-Specific Features
 - Global hotkeys work even when application is not focused
@@ -141,10 +152,11 @@ JSON config stored in `%APPDATA%\clip-helper\config.json`:
 - **Error handling**: Files that can't be read are marked with 0.0 duration and retried later
 
 ### Hotkey Target Duration Assignment
-- **Immediate application**: Hotkeys first try to find existing clips matching the timestamp
-- **Deferred application**: If no existing clip found, store request for future file matching
+- **Persistence-based**: Duration requests saved to JSON when hotkeys pressed
+- **Display-time matching**: Duration assignment happens during UI rendering for real-time feedback
 - **Resilient matching**: Target duration applies even to grayed-out (invalid) clips
-- **Extended window**: Pending requests remain active for 30 seconds to catch delayed file creation
+- **Extended window**: Duration requests remain active for 1 hour, cleaned up automatically
+- **Multiple changes**: Latest request within 10-second window always wins
 
 ### UI Responsiveness
 - **Non-blocking operations**: No FFmpeg calls during UI rendering

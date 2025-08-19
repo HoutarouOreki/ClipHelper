@@ -47,6 +47,8 @@ src/
 #### Hotkey System
 - Global hotkey registration for Ctrl+1-5
 - Event broadcasting system for clip requests
+- Persistence-based duration request system
+- Latest-request-wins duration assignment
 - Background hotkey processing thread
 
 #### Video Processing
@@ -69,18 +71,26 @@ src/
 - OBS replay file timestamp parsing
 - Startup behavior: Restore last watched directory or wait for user selection if none exists
 
+#### ✅ Advanced Duration Management - COMPLETED
+- **Persistence System**: Duration requests saved to `%APPDATA%\clip-helper\duration_requests.json`
+- **Multiple Changes**: Support for changing clip duration multiple times within 10-second window
+- **Latest Wins**: Most recent hotkey press always takes precedence
+- **Display-time Matching**: Duration assignment happens during UI rendering for immediate feedback
+- **Automatic Cleanup**: Old duration requests removed after 1 hour
+
 ## 🚧 NEXT STEPS - Implementation Priority
 
 ### Phase 1: Core Functionality (Week 1-2)
-1. **Fix Hotkey Integration**
-   - Resolve global-hotkey API compatibility
-   - Implement actual hotkey event processing
-   - Test hotkey registration on Windows
+1. **✅ Hotkey Integration - COMPLETED**
+   - ✅ Resolved global-hotkey API compatibility
+   - ✅ Implemented persistence-based duration request system
+   - ✅ Tested hotkey registration on Windows
+   - ✅ Added latest-request-wins duration assignment
 
-2. **Complete File Monitoring**
-   - Implement real-time OBS file detection
-   - Match hotkey timestamps to replay files
-   - Handle 10-second matching window
+2. **✅ File Monitoring - COMPLETED**  
+   - ✅ Implemented real-time OBS file detection
+   - ✅ Match duration requests to replay files at display time
+   - ✅ Handle 10-second matching window with direction awareness
 
 3. **Basic Video Preview**
    - Integrate video thumbnail generation
@@ -153,15 +163,20 @@ src/
 
 ### Hotkeys (Ctrl+1-5)
 - [x] Basic registration framework
-- [ ] Fix API compatibility
-- [ ] Test on Windows
-- [ ] Background event processing
+- [x] Fix API compatibility
+- [x] Test on Windows
+- [x] Background event processing
+- [x] Persistence-based duration requests
+- [x] Latest-request-wins logic
+- [x] Multiple duration changes support
 
 ### File Management
 - [x] Configuration system
 - [x] Directory structure
-- [ ] OBS file monitoring
-- [ ] Timestamp matching (10s window)
+- [x] OBS file monitoring
+- [x] Timestamp matching (10s window)
+- [x] Display-time duration assignment
+- [x] Automatic request cleanup
 
 ### Video Processing
 - [x] FFmpeg command generation
