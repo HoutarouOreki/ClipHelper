@@ -18,6 +18,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 notify = "6.1"
 
+# Caching utilities
+lru = "0.12"
+
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
 
@@ -44,6 +47,9 @@ uuid = { version = "1.0", features = ["v4"] }
 
 # Directory utilities
 dirs = "5.0"
+
+# Image processing for thumbnails and video frames
+image = "0.25"
 
 [dependencies.windows]
 version = "0.52"

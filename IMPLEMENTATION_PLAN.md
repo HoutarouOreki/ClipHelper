@@ -92,10 +92,12 @@ src/
    - ✅ Match duration requests to replay files at display time
    - ✅ Handle 10-second matching window with direction awareness
 
-3. **Basic Video Preview**
-   - Integrate video thumbnail generation
-   - Implement seek/scrub functionality
-   - Add play/pause controls
+3. **✅ Basic Video Preview - COMPLETED**
+   - ✅ Embedded video player with FFmpeg integration
+   - ✅ Hybrid architecture: instant seeking + smooth 30 FPS playback
+   - ✅ Sequence tracking system to prevent position jumping
+   - ✅ Non-blocking frame processing with proper aspect ratios
+   - ✅ Integrated timeline scrubbing with immediate preview updates
 
 ### Phase 2: Timeline & Editing (Week 3-4)
 1. **Timeline Widget**
@@ -256,7 +258,7 @@ RUST_LOG=debug cargo run
 ### Minimum Viable Product (MVP)
 - [ ] Hotkeys capture clips with correct durations
 - [ ] Timeline allows basic trimming
-- [ ] Video preview shows current position
+- [x] Video preview shows current position
 - [ ] Apply button trims and saves clips
 - [ ] Delete button moves clips to deleted folder
 - [ ] Audio tracks can be enabled/disabled

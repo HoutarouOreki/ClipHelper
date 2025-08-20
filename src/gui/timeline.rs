@@ -18,7 +18,12 @@ impl TimelineWidget {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, clip: &mut Clip, video_preview: &mut Option<VideoPreview>) -> egui::Response {
-        let duration = clip.duration_seconds as f64;
+        // Use the original video duration, not the clip's target duration
+        let duration = if let Some(preview) = video_preview {
+            preview.total_duration
+        } else {
+            clip.duration_seconds as f64
+        };
         let trim_start = clip.trim_start;
         let trim_end = clip.trim_end;
         
@@ -152,28 +157,41 @@ impl TimelineWidget {
                             // Clicked end handle
                             self.is_scrubbing = true;
                         } else {
-                            // Clicked timeline - seek
+                            // Clicked timeline - seek with immediate thumbnail
                             if let Some(preview) = video_preview {
                                 preview.seek_to(clicked_time);
+                                // Request immediate thumbnail for responsive clicking
+                                preview.request_thumbnail_immediate();
                             }
                             self.scrub_position = clicked_time;
                         }
                     }
                     
-                    // Handle dragging for trim adjustment
-                    if response.dragged() && self.is_scrubbing {
-                        let clamped_time = clicked_time.clamp(0.0, duration);
-                        
-                        // Determine which handle is closer
-                        let dist_to_start = (clicked_time - trim_start).abs();
-                        let dist_to_end = (clicked_time - trim_end).abs();
-                        
-                        if dist_to_start < dist_to_end {
-                            // Adjust start trim
-                            clip.trim_start = clamped_time.min(trim_end - 0.1);
+                    // Handle dragging for both trim adjustment AND timeline scrubbing
+                    if response.dragged() {
+                        if self.is_scrubbing {
+                            // Trim adjustment
+                            let clamped_time = clicked_time.clamp(0.0, duration);
+                            
+                            // Determine which handle is closer
+                            let dist_to_start = (clicked_time - trim_start).abs();
+                            let dist_to_end = (clicked_time - trim_end).abs();
+                            
+                            if dist_to_start < dist_to_end {
+                                // Adjust start trim
+                                clip.trim_start = clamped_time.min(trim_end - 0.1);
+                            } else {
+                                // Adjust end trim
+                                clip.trim_end = clamped_time.max(trim_start + 0.1);
+                            }
                         } else {
-                            // Adjust end trim
-                            clip.trim_end = clamped_time.max(trim_start + 0.1);
+                            // Timeline scrubbing - seek to dragged position
+                            if let Some(preview) = video_preview {
+                                preview.seek_to(clicked_time);
+                                // Request immediate thumbnail for responsive scrubbing
+                                preview.request_thumbnail_immediate();
+                            }
+                            self.scrub_position = clicked_time;
                         }
                     }
                 }

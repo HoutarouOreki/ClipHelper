@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,7 +9,7 @@ pub struct VideoPreview {
     pub total_duration: f64,
     pub video_path: Option<PathBuf>,
     pub current_thumbnail_cache_key: Option<String>,
-    embedded_process: Option<Child>,
+    ffplay_process: Option<Child>,
     smart_thumbnail_cache: Option<Arc<crate::video::SmartThumbnailCache>>,
     last_thumbnail_request: Option<Instant>,
 }
@@ -22,7 +22,7 @@ impl VideoPreview {
             total_duration: duration,
             video_path: None,
             current_thumbnail_cache_key: None,
-            embedded_process: None,
+            ffplay_process: None,
             smart_thumbnail_cache: None,
             last_thumbnail_request: None,
         }
@@ -42,17 +42,11 @@ impl VideoPreview {
     }
 
     fn request_thumbnail_for_current_time(&mut self) {
-        self.request_thumbnail_for_current_time_with_cooldown(true);
-    }
-
-    fn request_thumbnail_for_current_time_with_cooldown(&mut self, use_cooldown: bool) {
-        // Reduced cooldown for more responsive clicking (was 50ms)
+        // Add cooldown to prevent thumbnail spam during seeking
         let now = Instant::now();
-        if use_cooldown {
-            if let Some(last_request) = self.last_thumbnail_request {
-                if now.duration_since(last_request).as_millis() < 20 {
-                    return; // Very brief cooldown to prevent extreme spam
-                }
+        if let Some(last_request) = self.last_thumbnail_request {
+            if now.duration_since(last_request).as_millis() < 50 {
+                return; // Too soon, skip this request
             }
         }
 
@@ -70,16 +64,9 @@ impl VideoPreview {
         }
     }
 
-    /// Request thumbnail immediately without cooldown (for user clicks)
-    pub fn request_thumbnail_immediate(&mut self) {
-        self.request_thumbnail_for_current_time_with_cooldown(false);
-    }
-
     pub fn seek_to(&mut self, time: f64) {
         let new_time = time.clamp(0.0, self.total_duration);
-        // More responsive seeking - always request thumbnail for user clicks
-        // But still avoid tiny movements for programmatic updates
-        if (self.current_time - new_time).abs() > 0.01 {
+        if (self.current_time - new_time).abs() > 0.1 {
             self.current_time = new_time;
             self.request_thumbnail_for_current_time();
             
@@ -100,11 +87,33 @@ impl VideoPreview {
     }
 
     pub fn play(&mut self) {
-        // For embedded playback, we'll request continuous thumbnails during playback
-        // rather than using external processes
-        self.is_playing = true;
-        self.request_thumbnail_for_current_time();
-        log::info!("Started embedded video playback at {:.3}s", self.current_time);
+        // Stop any existing playback first
+        if self.ffplay_process.is_some() {
+            self.stop();
+        }
+        
+        if let Some(video_path) = &self.video_path {
+            // Start FFplay at current position
+            match Command::new("ffplay")
+                .arg("-i")
+                .arg(video_path)
+                .arg("-ss")
+                .arg(format!("{:.3}", self.current_time))
+                .arg("-autoexit")
+                .arg("-x").arg("640")
+                .arg("-y").arg("480")
+                .spawn()
+            {
+                Ok(child) => {
+                    self.ffplay_process = Some(child);
+                    self.is_playing = true;
+                    log::info!("Started video playback at {:.3}s", self.current_time);
+                }
+                Err(e) => {
+                    log::error!("Failed to start video playback: {}", e);
+                }
+            }
+        }
     }
 
     pub fn pause(&mut self) {
@@ -113,7 +122,7 @@ impl VideoPreview {
     }
 
     pub fn stop(&mut self) {
-        if let Some(mut process) = self.embedded_process.take() {
+        if let Some(mut process) = self.ffplay_process.take() {
             let _ = process.kill();
             let _ = process.wait();
         }
@@ -154,8 +163,8 @@ impl VideoPreview {
                 self.current_time = self.total_duration;
             }
             
-            // Request new thumbnail more frequently during playback for smooth video
-            if (self.current_time - old_time).abs() > 0.5 {
+            // Request new thumbnail if we've moved significantly (reduced frequency)
+            if (self.current_time - old_time).abs() > 2.0 {
                 self.request_thumbnail_for_current_time();
             }
         }
@@ -163,17 +172,17 @@ impl VideoPreview {
 
     /// Check if FFplay process is still running
     pub fn is_process_alive(&mut self) -> bool {
-        if let Some(process) = &mut self.embedded_process {
+        if let Some(process) = &mut self.ffplay_process {
             match process.try_wait() {
                 Ok(Some(_)) => {
                     // Process has exited
-                    self.embedded_process = None;
+                    self.ffplay_process = None;
                     self.is_playing = false;
                     false
                 }
                 Ok(None) => true, // Still running
                 Err(_) => {
-                    self.embedded_process = None;
+                    self.ffplay_process = None;
                     self.is_playing = false;
                     false
                 }

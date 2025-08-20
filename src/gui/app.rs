@@ -6,6 +6,7 @@ use crate::gui::timeline::TimelineWidget;
 use crate::audio::AudioConfirmation;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -56,10 +57,16 @@ pub struct ClipHelperApp {
     pub show_drives_view: bool,
     /// Last time we checked for video info updates (for clips that might still be writing)
     pub last_video_info_check: std::time::Instant,
+    /// Last time we processed thumbnail results (to avoid every-frame processing)
+    pub last_thumbnail_processing: std::time::Instant,
     /// Whether we've done the initial file scan yet
     pub initial_scan_completed: bool,
     /// Audio confirmation system for clip detection sounds
     pub audio_confirmation: Option<AudioConfirmation>,
+    /// Smart thumbnail cache for video preview
+    pub smart_thumbnail_cache: Option<Arc<crate::video::SmartThumbnailCache>>,
+    /// Embedded video player for in-UI playback
+    pub embedded_video_player: Option<crate::video::EmbeddedVideoPlayer>,
 }
 
 impl ClipHelperApp {
@@ -131,6 +138,18 @@ impl ClipHelperApp {
             }
         };
 
+        // Initialize smart thumbnail cache
+        let smart_thumbnail_cache = match crate::video::SmartThumbnailCache::new() {
+            Ok(cache) => {
+                log::info!("Smart thumbnail cache initialized successfully");
+                Some(Arc::new(cache))
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize smart thumbnail cache: {}", e);
+                None
+            }
+        };
+
         let app = Self {
             config,
             clips,
@@ -153,8 +172,11 @@ impl ClipHelperApp {
             timeline_widget: TimelineWidget::new(),
             show_drives_view: false,
             last_video_info_check: std::time::Instant::now(),
+            last_thumbnail_processing: std::time::Instant::now(),
             initial_scan_completed: false,
             audio_confirmation,
+            smart_thumbnail_cache,
+            embedded_video_player: None,
         };
 
         // Don't load saved clips here - we'll apply saved config after scanning files
@@ -176,6 +198,19 @@ impl ClipHelperApp {
 
     pub fn select_clip(&mut self, index: usize) {
         if index < self.clips.len() {
+            // Stop any existing video preview first to clean up FFplay processes
+            if let Some(mut preview) = self.video_preview.take() {
+                preview.stop();
+            }
+            
+            // Stop any existing embedded video player properly
+            if let Some(mut player) = self.embedded_video_player.take() {
+                log::debug!("Stopping existing embedded video player");
+                player.stop();
+                // Give it a moment to fully stop
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            
             self.selected_clip_index = Some(index);
             
             // Lazily load video info for the selected clip if not already loaded
@@ -199,7 +234,26 @@ impl ClipHelperApp {
             
             // Initialize video preview for selected clip
             if let Some(clip) = self.clips.get(index) {
-                self.video_preview = Some(VideoPreview::new(clip.trim_end));
+                if let Some(duration) = clip.video_length_seconds {
+                    let mut preview = VideoPreview::new(duration);
+                    preview.set_video(clip.original_file.clone(), duration);
+                    
+                    // Set smart thumbnail cache if available
+                    if let Some(ref cache) = self.smart_thumbnail_cache {
+                        preview.set_smart_thumbnail_cache(cache.clone());
+                    }
+                    
+                    self.video_preview = Some(preview);
+                    
+                    // Initialize embedded video player for the selected clip
+                    let mut player = crate::video::EmbeddedVideoPlayer::new();
+                    player.set_video(clip.original_file.clone(), duration);
+                    // Start paused - will be controlled by play button
+                    self.embedded_video_player = Some(player);
+                } else {
+                    // Video info not loaded yet, create basic preview
+                    self.video_preview = Some(VideoPreview::new(clip.trim_end));
+                }
             }
         }
     }
@@ -1158,75 +1212,289 @@ impl ClipHelperApp {
             if let Some(clip) = self.clips.get(selected_index) {
                 ui.heading("Clip Editor");
                 
-                // Clip info
-                ui.horizontal(|ui| {
-                    ui.label("File:");
-                    ui.label(clip.original_file.file_name().unwrap_or_default().to_string_lossy());
-                });
+                // Store clip info to avoid borrowing issues
+                let clip_name = clip.original_file.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let duration = clip.duration_seconds;
+                let trim_start = clip.trim_start;
+                let trim_end = clip.trim_end;
                 
-                ui.horizontal(|ui| {
-                    ui.label("Duration:");
-                    ui.label(format!("{:.1}s", clip.duration_seconds));
-                    ui.separator();
-                    ui.label("Trim:");
-                    ui.label(format!("{:.1}s - {:.1}s", clip.trim_start, clip.trim_end));
-                });
-                
-                // Clip name input
-                ui.horizontal(|ui| {
-                    ui.label("Output name:");
-                    ui.text_edit_singleline(&mut self.new_clip_name);
-                });
-                
-                ui.separator();
-                
-                // Timeline would go here
-                self.show_timeline(ui);
-                
-                ui.separator();
-                
-                // Control buttons
-                self.show_controls(ui);
-                
-                ui.separator();
-                
-                // Audio track controls
-                self.show_audio_controls(ui);
-                
-                ui.separator();
-                
-                // Action buttons
-                ui.horizontal(|ui| {
-                    if ui.button("✂ Apply Trim").clicked() {
-                        if let Err(e) = self.apply_trim(false) {
-                            log::error!("Failed to apply trim: {}", e);
-                            self.status_message = format!("Error applying trim: {}", e);
-                        } else {
-                            self.status_message = "Trim applied successfully".to_string();
-                        }
-                    }
+                // Vertical layout: Video preview on top, controls below
+                ui.vertical(|ui| {
+                    // Top section - Video preview
+                    ui.group(|ui| {
+                        self.show_video_preview(ui);
+                    });
                     
-                    if ui.button("🗑 Delete").clicked() {
-                        if let Err(e) = self.delete_selected_clip() {
-                            log::error!("Failed to delete clip: {}", e);
-                            self.status_message = format!("Error deleting clip: {}", e);
-                        } else {
-                            self.status_message = "Clip moved to deleted folder".to_string();
-                        }
-                    }
+                    ui.add_space(10.0);
                     
-                    // Shift+click for force overwrite
+                    // Bottom section - Controls
+                    ui.horizontal(|ui| {
+                        // Left side - Clip info
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("File:");
+                                ui.label(&clip_name);
+                            });
+                            
+                            ui.horizontal(|ui| {
+                                ui.label("Duration:");
+                                ui.label(format!("{:.1}s", duration));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Trim:");
+                                ui.label(format!("{:.1}s - {:.1}s", trim_start, trim_end));
+                            });
+                            
+                            // Clip name input
+                            ui.horizontal(|ui| {
+                                ui.label("Output name:");
+                                ui.text_edit_singleline(&mut self.new_clip_name);
+                            });
+                        });
+                        
+                        ui.separator();
+                        
+                        // Right side - Action buttons
+                        ui.vertical(|ui| {
+                            if ui.button("✂ Apply Trim").clicked() {
+                                if let Err(e) = self.apply_trim(false) {
+                                    log::error!("Failed to apply trim: {}", e);
+                                    self.status_message = format!("Error applying trim: {}", e);
+                                } else {
+                                    self.status_message = "Trim applied successfully".to_string();
+                                }
+                            }
+                            
+                            if ui.button("🗑 Delete").clicked() {
+                                if let Err(e) = self.delete_selected_clip() {
+                                    log::error!("Failed to delete clip: {}", e);
+                                    self.status_message = format!("Error deleting clip: {}", e);
+                                } else {
+                                    self.status_message = "Clip moved to deleted folder".to_string();
+                                }
+                            }
+                            
+                            ui.small("Hold Shift and click Apply to overwrite existing files");
+                        });
+                    });
+                    
                     ui.separator();
-                    ui.label("Hold Shift and click Apply to overwrite existing files");
+                    
+                    // Timeline
+                    self.show_timeline(ui);
+                    
+                    ui.separator();
+                    
+                    // Control buttons
+                    self.show_controls(ui);
+                    
+                    ui.separator();
+                    
+                    // Audio track controls
+                    self.show_audio_controls(ui);
                 });
             }
+        }
+    }
+
+    fn show_video_preview(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Video Preview");
+        
+        // Process completed thumbnails more frequently for responsive user interaction
+        if let Some(ref cache) = self.smart_thumbnail_cache {
+            let now = std::time::Instant::now();
+            // Reduced from 100ms to 30ms for more responsive thumbnail updates during clicking
+            if now.duration_since(self.last_thumbnail_processing).as_millis() > 30 {
+                cache.process_completed_thumbnails(ui.ctx());
+                self.last_thumbnail_processing = now;
+            }
+        }
+        
+        if let Some(preview) = &mut self.video_preview {
+            // Update preview time more frequently for smooth timeline updates
+            if preview.is_playing {
+                let now = std::time::Instant::now();
+                if now.duration_since(self.last_video_info_check).as_millis() > 33 { // ~30 FPS updates
+                    // Sync with embedded player if available
+                    if let Some(ref player) = self.embedded_video_player {
+                        preview.seek_to(player.current_time());
+                    } else {
+                        preview.update_time(0.033); // 33ms for smooth updates
+                    }
+                    self.last_video_info_check = now;
+                }
+            }
+            
+            // Video display area - fixed size to prevent UI jumping
+            let available_rect = ui.available_rect_before_wrap();
+            
+            // Set fixed size for video preview container (prevent jumping when thumbnails load)
+            let preview_height = (available_rect.height() * 0.6).min(400.0); // Max 60% of available height or 400px
+            let preview_width = available_rect.width();
+            let container_size = egui::Vec2::new(preview_width, preview_height);
+            
+            // Use allocate_exact_size to prevent container from changing size
+            let (container_rect, _) = ui.allocate_exact_size(container_size, egui::Sense::hover());
+            
+            ui.allocate_ui_at_rect(container_rect, |ui| {
+                ui.set_clip_rect(container_rect);
+                
+                // Check if we have embedded video player with current frame
+                if let Some(ref mut player) = self.embedded_video_player {
+                    // Only update player position if it's significantly different or for user interactions
+                    // This prevents constant FFmpeg restarts and maintains smooth playback
+                    let time_diff = (preview.current_time - player.current_time()).abs();
+                    if time_diff > 0.1 {
+                        log::debug!("Significant time difference {:.2}s, seeking to {:.1}s", time_diff, preview.current_time);
+                        player.seek(preview.current_time);
+                    }
+                    
+                    // Get current video frame as texture
+                    if let Some(frame_texture) = player.update(ui.ctx()) {
+                        log::debug!("Got frame texture with size {:?}", frame_texture.size_vec2());
+                        
+                        // Display video frame - scale to fill container while preserving aspect ratio
+                        let img_size = frame_texture.size_vec2();
+                        
+                        // Calculate scale to fill container (use min to ensure it fits within bounds)
+                        let scale_x = container_size.x / img_size.x;
+                        let scale_y = container_size.y / img_size.y;
+                        let scale = scale_x.min(scale_y);
+                        
+                        let display_size = img_size * scale;
+                        
+                        // Center the video in the container
+                        let video_pos = container_rect.center() - display_size * 0.5;
+                        let video_rect = egui::Rect::from_min_size(video_pos, display_size);
+                        
+                        ui.allocate_ui_at_rect(video_rect, |ui| {
+                            ui.add(egui::Image::from_texture(frame_texture)
+                                .fit_to_exact_size(display_size));
+                        });
+                        
+                        // Show timestamp at bottom of container
+                        let timestamp_pos = egui::pos2(container_rect.center().x, container_rect.max.y - 20.0);
+                        ui.allocate_ui_at_rect(
+                            egui::Rect::from_center_size(timestamp_pos, egui::Vec2::new(200.0, 20.0)),
+                            |ui| {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(format!("Video at {:.1}s", preview.current_time));
+                                });
+                            }
+                        );
+                    } else {
+                        log::debug!("No frame texture available from embedded player");
+                        // No video frame ready yet - show loading in center
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Loading video frame...");
+                        });
+                    }
+                } else {
+                    log::debug!("No embedded video player available, falling back to thumbnails");
+                    
+                    if let Some(cached_thumbnail) = preview.get_current_thumbnail() {
+                        // Fallback to cached thumbnail if no embedded player available
+                        // Display cached texture - scale to fill container while preserving aspect ratio
+                        let img_size = cached_thumbnail.texture_handle.size_vec2();
+                    
+                    // Calculate scale to fill container (use max instead of min to fill, not fit)
+                    let scale_x = container_size.x / img_size.x;
+                    let scale_y = container_size.y / img_size.y;
+                    let scale = scale_x.min(scale_y); // Use min to ensure it fits within bounds
+                    
+                    let display_size = img_size * scale;
+                    
+                    // Center the image in the container
+                    let image_pos = container_rect.center() - display_size * 0.5;
+                    let image_rect = egui::Rect::from_min_size(image_pos, display_size);
+                    
+                    ui.allocate_ui_at_rect(image_rect, |ui| {
+                        ui.add(egui::Image::from_texture(&cached_thumbnail.texture_handle)
+                            .fit_to_exact_size(display_size));
+                    });
+                    
+                    // Show timestamp at bottom of container
+                    let timestamp_pos = egui::pos2(container_rect.center().x, container_rect.max.y - 20.0);
+                    ui.allocate_ui_at_rect(
+                        egui::Rect::from_center_size(timestamp_pos, egui::Vec2::new(200.0, 20.0)),
+                        |ui| {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(format!("Thumbnail at {:.1}s", cached_thumbnail.timestamp));
+                            });
+                        }
+                    );
+                    } else {
+                        // No thumbnail ready yet - show loading in center
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Loading video...");
+                        });
+                    }
+                }
+            });
+            
+            ui.add_space(10.0);
+            
+            // Time display only - seeking handled by timeline below
+            ui.horizontal(|ui| {
+                ui.label(format!("Time: {:.1}s / {:.1}s", preview.current_time, preview.total_duration));
+            });
+            
+            // Process status - show embedded player status or fallback to preview
+            if let Some(ref player) = self.embedded_video_player {
+                if preview.is_playing && !player.is_playing() {
+                    ui.label("⚠ Embedded video playback stopped");
+                }
+            } else if preview.is_playing && !preview.is_process_alive() {
+                ui.label("⚠ Video playback stopped");
+            }
+            
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label("No video preview available");
+            });
         }
     }
 
     fn show_timeline(&mut self, ui: &mut egui::Ui) {
         if let Some(selected_index) = self.selected_clip_index {
             if let Some(clip) = self.clips.get_mut(selected_index) {
-                self.timeline_widget.show(ui, clip, &mut self.video_preview);
+                let timeline_response = self.timeline_widget.show(ui, clip, &mut self.video_preview);
+                
+                // If user interacted with timeline, handle seeking appropriately
+                if timeline_response.clicked() {
+                    // Immediate seek for clicks
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        if let Some(preview) = &mut self.video_preview {
+                            log::debug!("Timeline click - forcing immediate seek to {:.2}s", preview.current_time);
+                            let seek_time = preview.current_time;
+                            player.seek_immediate(seek_time);
+                            // Immediately update preview to prevent position jumping
+                            preview.seek_to(seek_time);
+                        }
+                    }
+                } else if timeline_response.dragged() {
+                    // During drag, just show preview without restarting stream
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        if let Some(preview) = &mut self.video_preview {
+                            let seek_time = preview.current_time;
+                            // Use regular seek (no stream restart) during drag for smooth preview
+                            player.seek(seek_time);
+                            // Keep preview in sync during drag
+                            preview.seek_to(seek_time);
+                        }
+                    }
+                } else if timeline_response.drag_stopped() {
+                    // When drag ends, do immediate seek to final position
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        if let Some(preview) = &mut self.video_preview {
+                            log::debug!("Timeline drag released - forcing immediate seek to {:.2}s", preview.current_time);
+                            let seek_time = preview.current_time;
+                            player.seek_immediate(seek_time);
+                            // Immediately update preview to prevent position jumping
+                            preview.seek_to(seek_time);
+                        }
+                    }
+                }
             }
         } else {
             ui.label("No clip selected");
@@ -1238,54 +1506,95 @@ impl ClipHelperApp {
             if ui.button("⏮ Start").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.goto_start();
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
             
             if ui.button("⏪ -10s").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_backward(10.0);
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
             
             if ui.button("⏪ -5s").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_backward(5.0);
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
             
             if ui.button("⏪ -3s").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_backward(3.0);
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
             
             if let Some(preview) = &mut self.video_preview {
                 if ui.button(if preview.is_playing { "⏸" } else { "▶" }).clicked() {
                     preview.toggle_playback();
+                    
+                    // Sync embedded video player playback state
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        if preview.is_playing {
+                            player.play();
+                        } else {
+                            player.pause();
+                        }
+                    }
                 }
             }
             
             if ui.button("3s ⏩").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_forward(3.0);
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
             
             if ui.button("5s ⏩").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_forward(5.0);
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
             
             if ui.button("10s ⏩").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_forward(10.0);
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
             
             if ui.button("Last 5s ⏭").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.goto_last_5_seconds();
+                    // Force immediate seek on embedded player
+                    if let Some(ref mut player) = self.embedded_video_player {
+                        player.seek_immediate(preview.current_time);
+                    }
                 }
             }
         });
@@ -1961,5 +2270,19 @@ fn get_drive_label(drive_path: &std::path::Path) -> Option<String> {
         }
     } else {
         None
+    }
+}
+
+impl Drop for ClipHelperApp {
+    fn drop(&mut self) {
+        // Clean up video preview processes when app shuts down
+        if let Some(mut preview) = self.video_preview.take() {
+            preview.stop();
+        }
+        
+        // Clean up thumbnail cache
+        if let Some(ref cache) = self.smart_thumbnail_cache {
+            cache.cleanup_old_thumbnails();
+        }
     }
 }
