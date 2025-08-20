@@ -118,6 +118,7 @@ src/
    - Directory configuration UI
    - FFmpeg path setup
    - Hotkey customization
+   - Audio confirmation settings (output device selection, sound file choice)
 
 2. **Batch Operations**
    - Multi-clip selection
@@ -189,7 +190,8 @@ src/
 - [x] Clip list sidebar
 - [ ] Timeline widget implementation
 - [ ] Playback controls integration
-- [ ] Settings dialog
+- [x] Settings dialog
+- [x] Audio confirmation system (clip detection sounds)
 
 ### Timeline Features
 - [ ] Scrubbing with mouse
@@ -211,6 +213,7 @@ src/
 - [ ] Track enable/disable UI
 - [ ] Surround mode configuration
 - [ ] Audio preview
+- [x] Clip detection confirmation sounds (configurable output device)
 
 ### File Operations
 - [x] Trim and save structure
@@ -266,5 +269,6 @@ RUST_LOG=debug cargo run
 - [ ] Batch operations
 - [ ] Settings configuration
 - [ ] Robust error handling
+- [x] Audio confirmation when clips are detected
 
 The foundation is solid and ready for implementing the remaining features. The architecture supports all planned functionality and provides a clear path forward for development.

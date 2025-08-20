@@ -3,6 +3,35 @@ use std::path::PathBuf;
 use global_hotkey::hotkey::{Code, Modifiers};
 use std::collections::HashMap;
 
+fn default_unmatched_sound_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfirmationConfig {
+    pub enabled: bool,
+    pub sound_file_path: Option<PathBuf>,
+    pub output_device_name: Option<String>,
+    pub volume: f32, // 0.0 to 1.0
+    #[serde(default)]
+    pub duration_confirmation_enabled: bool, // For duration-specific beep sounds
+    #[serde(default = "default_unmatched_sound_enabled")]
+    pub unmatched_sound_enabled: bool, // For unmatched hotkey sounds
+}
+
+impl Default for AudioConfirmationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sound_file_path: None,
+            output_device_name: None,
+            volume: 0.5,
+            duration_confirmation_enabled: false,
+            unmatched_sound_enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeyConfig {
     pub modifiers: String, // "Ctrl", "Alt", "Shift", "Ctrl+Alt", etc.
@@ -98,6 +127,9 @@ pub struct AppConfig {
     pub last_watched_directory: Option<PathBuf>,
     pub ffmpeg_path: Option<PathBuf>,
     pub hotkeys: HashMap<String, HotkeyConfig>,
+    pub audio_confirmation: AudioConfirmationConfig,
+    #[serde(default)]
+    pub use_system_file_dialog: bool, // True for system dialog, false for built-in browser
 }
 
 impl Default for AppConfig {
@@ -134,6 +166,8 @@ impl Default for AppConfig {
             last_watched_directory: None,
             ffmpeg_path: None,
             hotkeys,
+            audio_confirmation: AudioConfirmationConfig::default(),
+            use_system_file_dialog: false, // Default to built-in browser
         }
     }
 }
@@ -141,7 +175,7 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load() -> anyhow::Result<Self> {
         let config_path = Self::config_path();
-        if config_path.exists() {
+        let mut config = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
                 .map_err(|e| anyhow::anyhow!("Failed to read config file at {}: {}", config_path.display(), e))?;
             
@@ -149,7 +183,7 @@ impl AppConfig {
             match serde_json::from_str::<Self>(&content) {
                 Ok(config) => {
                     log::info!("Loaded existing config from {}", config_path.display());
-                    Ok(config)
+                    config
                 }
                 Err(e) => {
                     log::warn!("Config file exists but has issues ({}), creating new one with defaults", e);
@@ -157,7 +191,7 @@ impl AppConfig {
                     new_config.save()
                         .map_err(|save_err| anyhow::anyhow!("Failed to save new config: {}", save_err))?;
                     log::info!("Created new config file at {}", config_path.display());
-                    Ok(new_config)
+                    new_config
                 }
             }
         } else {
@@ -166,8 +200,27 @@ impl AppConfig {
             config.save()
                 .map_err(|e| anyhow::anyhow!("Failed to save default config: {}", e))?;
             log::info!("Created new config file at {}", config_path.display());
-            Ok(config)
+            config
+        };
+        
+        // Ensure default confirmation sound exists if audio confirmation is enabled but no sound file is set
+        if config.audio_confirmation.enabled && config.audio_confirmation.sound_file_path.is_none() {
+            match crate::audio::ensure_default_confirmation_sound() {
+                Ok(default_sound_path) => {
+                    log::info!("Set default confirmation sound: {}", default_sound_path.display());
+                    config.audio_confirmation.sound_file_path = Some(default_sound_path);
+                    // Save the updated config
+                    if let Err(e) = config.save() {
+                        log::warn!("Failed to save config with default sound path: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to create default confirmation sound: {}", e);
+                }
+            }
         }
+        
+        Ok(config)
     }
 
     pub fn save(&self) -> anyhow::Result<()> {

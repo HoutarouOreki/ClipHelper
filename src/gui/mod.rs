@@ -3,7 +3,7 @@ pub mod clip_list;
 pub mod timeline;
 pub mod controls;
 
+#[cfg(test)]
+mod app_test;
+
 pub use app::*;
-pub use clip_list::*;
-pub use timeline::*;
-pub use controls::*;

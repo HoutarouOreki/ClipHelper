@@ -1,8 +1,8 @@
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::hotkey::HotKey;
 use tokio::sync::broadcast;
 use crate::hotkeys::{HotkeyEvent, HotkeyId};
-use crate::core::{AppConfig, HotkeyConfig};
+use crate::core::AppConfig;
 use std::collections::HashMap;
 
 pub struct HotkeyManager {

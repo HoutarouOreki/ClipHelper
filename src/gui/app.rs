@@ -3,7 +3,9 @@ use crate::core::{Clip, AppConfig, FileMonitor, NewReplayFile};
 use crate::video::{VideoPreview, WaveformData};
 use crate::hotkeys::{HotkeyManager, HotkeyEvent};
 use crate::gui::timeline::TimelineWidget;
+use crate::audio::AudioConfirmation;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::sync::broadcast;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -45,14 +47,19 @@ pub struct ClipHelperApp {
     pub duration_requests: Vec<DurationRequest>,
     pub watched_directory: Option<std::path::PathBuf>,
     pub show_directory_dialog: bool,
+    pub show_settings_dialog: bool,
     pub status_message: String,
     pub directory_browser_path: std::path::PathBuf,
+    pub file_browser_path: std::path::PathBuf, // For file browser dialog
+    pub show_sound_file_browser: bool, // Whether to show the sound file browser
     pub timeline_widget: TimelineWidget,
     pub show_drives_view: bool,
     /// Last time we checked for video info updates (for clips that might still be writing)
     pub last_video_info_check: std::time::Instant,
     /// Whether we've done the initial file scan yet
     pub initial_scan_completed: bool,
+    /// Audio confirmation system for clip detection sounds
+    pub audio_confirmation: Option<AudioConfirmation>,
 }
 
 impl ClipHelperApp {
@@ -112,7 +119,19 @@ impl ClipHelperApp {
         let clips = Vec::new();
         // Note: File scanning moved to background - UI shows immediately
 
-        let mut app = Self {
+        // Initialize audio confirmation system
+        let audio_confirmation = match AudioConfirmation::new() {
+            Ok(audio) => {
+                log::info!("Audio confirmation system initialized successfully");
+                Some(audio)
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize audio confirmation system: {}", e);
+                None
+            }
+        };
+
+        let app = Self {
             config,
             clips,
             selected_clip_index: None,
@@ -126,12 +145,16 @@ impl ClipHelperApp {
             duration_requests: Vec::new(),
             watched_directory,
             show_directory_dialog: false,
+            show_settings_dialog: false,
             status_message: String::new(),
             directory_browser_path: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\")),
+            file_browser_path: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\")),
+            show_sound_file_browser: false,
             timeline_widget: TimelineWidget::new(),
             show_drives_view: false,
             last_video_info_check: std::time::Instant::now(),
             initial_scan_completed: false,
+            audio_confirmation,
         };
 
         // Don't load saved clips here - we'll apply saved config after scanning files
@@ -227,6 +250,15 @@ impl ClipHelperApp {
                     let now = Local::now();
                     log::info!("Hotkey triggered for {:?} at {}", duration, now);
                     
+                    // Check if there are any recent clips that can be matched to this duration request
+                    let mut found_matching_clip = false;
+                    for clip in &self.clips {
+                        if Self::timestamps_match_static(now, clip.timestamp) {
+                            found_matching_clip = true;
+                            break;
+                        }
+                    }
+                    
                     // Simply save the duration request - matching will happen at display time
                     self.duration_requests.push(DurationRequest {
                         timestamp: now,
@@ -240,6 +272,18 @@ impl ClipHelperApp {
                     // Save duration requests to persistence
                     if let Err(e) = self.save_duration_requests() {
                         log::error!("Failed to save duration requests: {}", e);
+                    }
+                    
+                    // Play unmatched sound if no clip was found to match this hotkey
+                    if !found_matching_clip {
+                        log::info!("No matching clip found for hotkey {} at {}", duration as u32, now);
+                        if let Some(ref mut audio_confirmation) = self.audio_confirmation {
+                            if self.config.audio_confirmation.unmatched_sound_enabled {
+                                if let Err(e) = audio_confirmation.play_unmatched_clip_sound(&self.config.audio_confirmation) {
+                                    log::warn!("Failed to play unmatched hotkey sound: {}", e);
+                                }
+                            }
+                        }
                     }
                     
                     log::info!("Saved duration request for {} at {}", duration as u32, now);
@@ -334,7 +378,7 @@ impl ClipHelperApp {
         diff <= 10 // Within 10 seconds
     }
     
-    fn create_clip_from_file(&mut self, file: NewReplayFile, _duration: Option<crate::core::ClipDuration>) {
+    fn create_clip_from_file(&mut self, file: NewReplayFile, duration: Option<crate::core::ClipDuration>) {
         // Check if a clip with this file path already exists
         if self.clips.iter().any(|existing_clip| existing_clip.original_file == file.path) {
             log::debug!("Clip already exists for file: {:?}", file.path);
@@ -349,6 +393,25 @@ impl ClipHelperApp {
                 // Don't block on video info - load it lazily when needed
                 log::info!("Created clip: {}", clip.get_output_filename());
                 self.clips.push(clip);
+                
+                // Play appropriate confirmation sound based on whether duration was matched
+                if let Some(ref mut audio_confirmation) = self.audio_confirmation {
+                    if let Some(duration) = duration {
+                        // Matched clip - play duration-specific sound
+                        if self.config.audio_confirmation.duration_confirmation_enabled {
+                            if let Err(e) = audio_confirmation.play_duration_confirmation(&duration, &self.config.audio_confirmation) {
+                                log::warn!("Failed to play duration confirmation sound: {}", e);
+                            }
+                        }
+                    } else {
+                        // Clip appeared without immediate hotkey match - play general confirmation sound
+                        if let Err(e) = audio_confirmation.play_confirmation_sound(&self.config.audio_confirmation) {
+                            log::warn!("Failed to play clip detection confirmation sound: {}", e);
+                        }
+                    }
+                } else {
+                    log::debug!("Audio confirmation system not available");
+                }
                 
                 // Save clips after adding new clip
                 if let Err(e) = self.save_clips() {
@@ -721,14 +784,41 @@ impl eframe::App for ClipHelperApp {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Select OBS Replay Directory").clicked() {
-                        self.show_directory_dialog = true;
+                        if self.config.use_system_file_dialog {
+                            // Use system folder picker - start in parent of current watched directory
+                            let mut folder_dialog = rfd::FileDialog::new()
+                                .set_title("Select OBS Replay Directory");
+                            
+                            // Set initial directory to parent of currently watched directory
+                            if let Some(ref current_dir) = self.watched_directory {
+                                if let Some(parent) = current_dir.parent() {
+                                    folder_dialog = folder_dialog.set_directory(parent);
+                                }
+                            }
+                            
+                            if let Some(folder_path) = folder_dialog.pick_folder() {
+                                log::info!("Selected directory: {}", folder_path.display());
+                                self.set_watched_directory(folder_path);
+                                self.status_message = "Directory selected".to_string();
+                            } else {
+                                log::debug!("Directory dialog was cancelled");
+                            }
+                        } else {
+                            // Use built-in directory browser - start in parent of current watched directory
+                            if let Some(ref current_dir) = self.watched_directory {
+                                if let Some(parent) = current_dir.parent() {
+                                    self.directory_browser_path = parent.to_path_buf();
+                                }
+                            }
+                            self.show_directory_dialog = true;
+                        }
                         ui.close_menu();
                     }
                     
                     ui.separator();
                     
                     if ui.button("Settings").clicked() {
-                        // TODO: Open settings dialog
+                        self.show_settings_dialog = true;
                         ui.close_menu();
                     }
                     if ui.button("Exit").clicked() {
@@ -776,7 +866,34 @@ impl eframe::App for ClipHelperApp {
                             ui.label("To get started, select your OBS replay directory from the File menu.");
                             ui.add_space(20.0);
                             if ui.button("📁 Select OBS Replay Directory").clicked() {
-                                self.show_directory_dialog = true;
+                                if self.config.use_system_file_dialog {
+                                    // Use system folder picker - start in parent of current watched directory
+                                    let mut folder_dialog = rfd::FileDialog::new()
+                                        .set_title("Select OBS Replay Directory");
+                                    
+                                    // Set initial directory to parent of currently watched directory
+                                    if let Some(ref current_dir) = self.watched_directory {
+                                        if let Some(parent) = current_dir.parent() {
+                                            folder_dialog = folder_dialog.set_directory(parent);
+                                        }
+                                    }
+                                    
+                                    if let Some(folder_path) = folder_dialog.pick_folder() {
+                                        log::info!("Selected directory: {}", folder_path.display());
+                                        self.set_watched_directory(folder_path);
+                                        self.status_message = "Directory selected".to_string();
+                                    } else {
+                                        log::debug!("Directory dialog was cancelled");
+                                    }
+                                } else {
+                                    // Use built-in directory browser - start in parent of current watched directory
+                                    if let Some(ref current_dir) = self.watched_directory {
+                                        if let Some(parent) = current_dir.parent() {
+                                            self.directory_browser_path = parent.to_path_buf();
+                                        }
+                                    }
+                                    self.show_directory_dialog = true;
+                                }
                             }
                         });
                     }
@@ -787,6 +904,16 @@ impl eframe::App for ClipHelperApp {
         // Show directory selection dialog
         if self.show_directory_dialog {
             self.show_directory_selection_dialog(ctx);
+        }
+
+        // Show sound file browser dialog
+        if self.show_sound_file_browser {
+            self.show_sound_file_browser_dialog(ctx);
+        }
+
+        // Show settings dialog
+        if self.show_settings_dialog {
+            self.render_settings_dialog(ctx);
         }
 
         // Status bar at bottom
@@ -960,6 +1087,15 @@ impl ClipHelperApp {
                     // We'll clean up old requests periodically instead
                     
                     log::info!("Applied duration request {} to clip {}", duration as u32, self.clips[clip_index].get_output_filename());
+                    
+                    // Play duration-specific confirmation sound
+                    if let Some(ref mut audio_confirmation) = self.audio_confirmation {
+                        if self.config.audio_confirmation.duration_confirmation_enabled {
+                            if let Err(e) = audio_confirmation.play_duration_confirmation(&duration, &self.config.audio_confirmation) {
+                                log::warn!("Failed to play duration confirmation sound: {}", e);
+                            }
+                        }
+                    }
                 }
                 
                 // Save changes if any duration updates were applied
@@ -1329,6 +1465,101 @@ impl ClipHelperApp {
             });
     }
 
+    fn show_sound_file_browser_dialog(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Select Confirmation Sound File")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(600.0)
+            .default_height(400.0)
+            .show(ctx, |ui| {
+                ui.label("Choose a sound file for confirmation:");
+                
+                // Current path display
+                ui.horizontal(|ui| {
+                    ui.label("Current path:");
+                    ui.text_edit_singleline(&mut format!("{}", self.file_browser_path.display()));
+                });
+                
+                ui.separator();
+                
+                // Navigation buttons
+                ui.horizontal(|ui| {
+                    if ui.button("⬆ Parent Directory").clicked() {
+                        if let Some(parent) = self.file_browser_path.parent() {
+                            self.file_browser_path = parent.to_path_buf();
+                        }
+                    }
+                    
+                    if ui.button("🏠 Home").clicked() {
+                        if let Some(home) = dirs::home_dir() {
+                            self.file_browser_path = home;
+                        }
+                    }
+                });
+                
+                ui.separator();
+                
+                // File and directory listing
+                egui::ScrollArea::vertical()
+                    .max_height(250.0)
+                    .show(ui, |ui| {
+                        if let Ok(entries) = std::fs::read_dir(&self.file_browser_path) {
+                            let mut items: Vec<_> = entries
+                                .filter_map(|e| e.ok())
+                                .collect();
+                            items.sort_by(|a, b| {
+                                // Directories first, then files
+                                match (a.path().is_dir(), b.path().is_dir()) {
+                                    (true, false) => std::cmp::Ordering::Less,
+                                    (false, true) => std::cmp::Ordering::Greater,
+                                    _ => a.file_name().cmp(&b.file_name()),
+                                }
+                            });
+                            
+                            for entry in items {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                let path = entry.path();
+                                
+                                if path.is_dir() {
+                                    if ui.selectable_label(false, format!("📁 {}", name)).clicked() {
+                                        self.file_browser_path = path;
+                                    }
+                                } else {
+                                    // Check if it's an audio file
+                                    let is_audio_file = if let Some(ext) = path.extension() {
+                                        let ext_str = ext.to_string_lossy().to_lowercase();
+                                        matches!(ext_str.as_str(), "wav" | "mp3" | "ogg" | "flac" | "m4a" | "aac")
+                                    } else {
+                                        false
+                                    };
+                                    
+                                    let icon = if is_audio_file { "🔊" } else { "📄" };
+                                    let label_text = format!("{} {}", icon, name);
+                                    
+                                    if ui.selectable_label(false, label_text).clicked() && is_audio_file {
+                                        self.config.audio_confirmation.sound_file_path = Some(path);
+                                        self.show_sound_file_browser = false;
+                                        self.status_message = "Sound file selected".to_string();
+                                        log::info!("Selected sound file: {}", self.config.audio_confirmation.sound_file_path.as_ref().unwrap().display());
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label("❌ Unable to read directory");
+                        }
+                    });
+                
+                ui.separator();
+                
+                // Action buttons
+                ui.horizontal(|ui| {
+                    if ui.button("❌ Cancel").clicked() {
+                        self.show_sound_file_browser = false;
+                    }
+                });
+            });
+    }
+
     fn set_watched_directory(&mut self, path: std::path::PathBuf) {
         log::info!("Setting watched directory to: {}", path.display());
         
@@ -1489,6 +1720,228 @@ impl ClipHelperApp {
             if let Err(e) = self.save_clips() {
                 log::error!("Failed to save clips after setting target duration: {}", e);
             }
+        }
+    }
+
+    fn render_settings_dialog(&mut self, ctx: &egui::Context) {
+        let mut close_dialog = false;
+        
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(1000.0)
+            .show(ctx, |ui| {
+                ui.heading("Audio Confirmation");
+                
+                ui.checkbox(&mut self.config.audio_confirmation.enabled, "Enable confirmation sound when clips are detected");
+                
+                ui.checkbox(&mut self.config.audio_confirmation.duration_confirmation_enabled, "Play duration-specific sounds when clips are marked");
+                
+                ui.checkbox(&mut self.config.audio_confirmation.unmatched_sound_enabled, "Play sound when hotkey pressed but no clips to match");
+                
+                ui.add_space(10.0);
+                
+                // File browser preference
+                ui.horizontal(|ui| {
+                    ui.label("File browser:");
+                    ui.radio_value(&mut self.config.use_system_file_dialog, false, "Built-in browser");
+                    ui.radio_value(&mut self.config.use_system_file_dialog, true, "System dialog");
+                });
+                
+                if self.config.audio_confirmation.enabled {
+                    ui.add_space(10.0);
+                    
+                    // Volume slider
+                    ui.horizontal(|ui| {
+                        ui.label("Volume:");
+                        if ui.add(egui::Slider::new(&mut self.config.audio_confirmation.volume, 0.0..=1.0)
+                            .show_value(false)).changed() {
+                            // Clamp volume to valid range
+                            self.config.audio_confirmation.volume = self.config.audio_confirmation.volume.clamp(0.0, 1.0);
+                        }
+                        ui.label(format!("{:.0}%", self.config.audio_confirmation.volume * 100.0));
+                    });
+                    
+                    ui.add_space(10.0);
+                    
+                    // Sound file selection
+                    ui.horizontal(|ui| {
+                        ui.label("Sound file:");
+                        
+                        // Editable text box for sound file path - make it expandable but with reasonable limits
+                        let mut sound_file_text = if let Some(ref path) = self.config.audio_confirmation.sound_file_path {
+                            path.to_string_lossy().to_string()
+                        } else {
+                            String::new()
+                        };
+                        
+                        let available_width = (ui.available_width() - 180.0).max(200.0); // Reserve space for buttons, ensure minimum usability
+                        if ui.add_sized([available_width, 20.0], egui::TextEdit::singleline(&mut sound_file_text)).changed() {
+                            if sound_file_text.trim().is_empty() {
+                                self.config.audio_confirmation.sound_file_path = None;
+                            } else {
+                                self.config.audio_confirmation.sound_file_path = Some(PathBuf::from(sound_file_text));
+                            }
+                        }
+                        
+                        if ui.button("Browse...").clicked() {
+                            if self.config.use_system_file_dialog {
+                                // Use system file dialog - start in current sound file's directory
+                                let mut file_dialog = rfd::FileDialog::new()
+                                    .add_filter("Audio Files", &["wav", "mp3", "ogg", "flac"])
+                                    .add_filter("WAV Files", &["wav"])
+                                    .add_filter("All Files", &["*"])
+                                    .set_title("Select Confirmation Sound File");
+                                
+                                // Set initial directory to current sound file's parent directory
+                                if let Some(ref current_path) = self.config.audio_confirmation.sound_file_path {
+                                    if let Some(parent) = current_path.parent() {
+                                        file_dialog = file_dialog.set_directory(parent);
+                                    }
+                                }
+                                
+                                if let Some(file_path) = file_dialog.pick_file() {
+                                    log::info!("Selected audio file: {}", file_path.display());
+                                    self.config.audio_confirmation.sound_file_path = Some(file_path);
+                                    self.status_message = "Sound file selected".to_string();
+                                } else {
+                                    log::debug!("File dialog was cancelled");
+                                }
+                            } else {
+                                // Use built-in file browser - start in current sound file's directory
+                                self.show_sound_file_browser = true;
+                                // Set starting path for browser
+                                if let Some(ref current_path) = self.config.audio_confirmation.sound_file_path {
+                                    if let Some(parent) = current_path.parent() {
+                                        self.file_browser_path = parent.to_path_buf();
+                                    }
+                                } else {
+                                    self.file_browser_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
+                                }
+                            }
+                        }
+                        
+                        if ui.button("Generate Default").clicked() {
+                            match crate::audio::ensure_default_confirmation_sound() {
+                                Ok(default_path) => {
+                                    self.config.audio_confirmation.sound_file_path = Some(default_path.clone());
+                                    log::info!("Generated default confirmation sound: {}", default_path.display());
+                                    self.status_message = "Default sound generated".to_string();
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to generate default confirmation sound: {}", e);
+                                    self.status_message = format!("Failed to generate sound: {}", e);
+                                }
+                            }
+                        }
+                    });
+                    
+                    ui.add_space(10.0);
+                    
+                    // Audio device selection
+                    ui.horizontal(|ui| {
+                        ui.label("Audio device:");
+                        
+                        let current_device = self.config.audio_confirmation.output_device_name
+                            .as_deref()
+                            .unwrap_or("(Default)");
+                        
+                        egui::ComboBox::from_id_source("audio_device_combo")
+                            .selected_text(current_device)
+                            .show_ui(ui, |ui| {
+                                // Add default option
+                                if ui.selectable_value(&mut self.config.audio_confirmation.output_device_name, None, "(Default)").clicked() {
+                                    log::debug!("Selected default audio device");
+                                }
+                                
+                                // Add available devices
+                                if let Some(ref audio_confirmation) = self.audio_confirmation {
+                                    for device in audio_confirmation.get_available_devices() {
+                                        let device_name = device.name.clone();
+                                        let display_name = if device.is_default {
+                                            format!("{} (Default)", device.name)
+                                        } else {
+                                            device.name.clone()
+                                        };
+                                        
+                                        if ui.selectable_value(
+                                            &mut self.config.audio_confirmation.output_device_name, 
+                                            Some(device_name.clone()), 
+                                            display_name
+                                        ).clicked() {
+                                            log::debug!("Selected audio device: {}", device_name);
+                                        }
+                                    }
+                                }
+                            });
+                        
+                        if ui.button("Refresh").clicked() {
+                            if let Some(ref mut audio_confirmation) = self.audio_confirmation {
+                                if let Err(e) = audio_confirmation.refresh_devices() {
+                                    log::error!("Failed to refresh audio devices: {}", e);
+                                    self.status_message = format!("Failed to refresh audio devices: {}", e);
+                                } else {
+                                    log::info!("Audio devices refreshed successfully");
+                                    self.status_message = "Audio devices refreshed".to_string();
+                                }
+                            }
+                        }
+                    });
+                    
+                    ui.add_space(10.0);
+                    
+                    // Test button
+                    if ui.button("Test Sound").clicked() {
+                        if let Some(ref mut audio_confirmation) = self.audio_confirmation {
+                            if let Err(e) = audio_confirmation.play_confirmation_sound(&self.config.audio_confirmation) {
+                                log::error!("Failed to test confirmation sound: {}", e);
+                                self.status_message = format!("Failed to play test sound: {}", e);
+                            } else {
+                                log::info!("Test sound played successfully");
+                                self.status_message = "Test sound played".to_string();
+                            }
+                        } else {
+                            log::warn!("Audio confirmation system not available");
+                            self.status_message = "Audio system not available".to_string();
+                        }
+                    }
+                }
+                
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(10.0);
+                
+                // Dialog buttons
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        if let Err(e) = self.config.save() {
+                            log::error!("Failed to save settings: {}", e);
+                            self.status_message = format!("Failed to save settings: {}", e);
+                        } else {
+                            log::info!("Settings saved successfully");
+                            self.status_message = "Settings saved".to_string();
+                            close_dialog = true;
+                        }
+                    }
+                    
+                    if ui.button("Cancel").clicked() {
+                        // Reload config to discard changes
+                        match AppConfig::load() {
+                            Ok(config) => {
+                                self.config = config;
+                                log::debug!("Settings changes discarded");
+                            }
+                            Err(e) => {
+                                log::error!("Failed to reload config: {}", e);
+                            }
+                        }
+                        close_dialog = true;
+                    }
+                });
+            });
+        
+        if close_dialog {
+            self.show_settings_dialog = false;
         }
     }
 }

@@ -53,20 +53,27 @@ Command-line FFmpeg for maximum compatibility. Key patterns:
 
 ## Development Workflows
 
-### Building & Testing
+### Checking & Testing
 ```bash
 cargo check               # Check compilation (preferred for development)
 cargo test                # Run test suite
-cargo build --release     # Production build (only when needed)
-RUST_LOG=debug cargo run  # Debug with logging (Windows: $env:RUST_LOG="debug"; cargo run)
 ```
+DO NOT EVER RUN ANY OTHER TERMINAL COMMANDS.
 
 ### Configuration System
 JSON config stored in `%APPDATA%\clip-helper\config.json`:
 ```json
 {
   "obs_replay_directory": "path/to/replays",
-  "last_watched_directory": "path/to/last/watched"
+  "last_watched_directory": "path/to/last/watched",
+  "use_system_file_dialog": false,
+  "audio_confirmation": {
+    "enabled": false,
+    "sound_file_path": null,
+    "output_device_name": null,
+    "volume": 0.5,
+    "duration_confirmation_enabled": false
+  }
 }
 ```
 
@@ -93,7 +100,7 @@ JSON config stored in `%APPDATA%\clip-helper\config.json`:
 - Unit tests for core data structures, file operations, and timestamp parsing
 - Integration tests for FFmpeg processing and file management workflows
 - Mock file systems for testing file monitoring and organization
-- Use `cargo test` for running tests, `cargo check` for compilation validation
+- Use `cargo test` for running tests, `cargo check` for compilation validation. Don't ever run any other commands.
 
 ## Common Development Tasks
 
@@ -120,6 +127,16 @@ JSON config stored in `%APPDATA%\clip-helper\config.json`:
 - **Lazy loading**: Video metadata only loaded when needed (selection or display)
 - **Session-based organization**: Efficient grouping without loading all video data
 - **File monitoring**: Event-driven updates instead of polling
+
+### Audio Confirmation System
+- **Multi-pattern sound system**: Different beep patterns for different durations (1-5 beeps for 15s-5m)
+- **Unmatched detection**: Low-frequency sound when hotkeys pressed but no clips to match
+- **Device selection**: Choose specific audio output device or use system default
+- **File browser options**: Built-in file browser vs system file dialog preference
+- **Editable paths**: Sound file paths can be typed directly or selected via browsing
+- **Volume control**: Adjustable confirmation sound volume (0-100%)
+- **Optional duration sounds**: Can be disabled while keeping general confirmation sounds enabled
+- **Configuration persistence**: All audio settings saved to `config.json` with backward compatibility
 
 ## Integration Points
 

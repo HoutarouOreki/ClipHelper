@@ -38,6 +38,17 @@ A Rust application designed to help streamline the process of trimming and organ
 - **Trimming**: Adjust start/end times by 1s or 5s increments
 - **File Management**: Delete (moves to "deleted" folder), Apply trim (saves to "trimmed" folder)
 
+### Audio Confirmation
+- **Clip Detection Sounds**: Optional audio notification when new clips are detected
+- **Duration-Specific Sounds**: Optional beep patterns when clips are marked with target durations (1-5 beeps for 15s-5m)
+- **Unmatched Hotkey Sounds**: Low-frequency sound when hotkey pressed but no clips available to match
+- **Configurable Output Device**: Choose specific audio device or use system default
+- **Volume Control**: Adjustable volume levels (0-100%)
+- **Custom Sound Files**: Use any WAV file or generate default beep sound
+- **Editable File Paths**: Manually edit the sound file path or browse with built-in/system dialogs
+- **File Browser Options**: Choose between built-in file browser or system file dialog
+- **Settings Integration**: Configure via File > Settings menu
+
 ### Audio Features
 - Visual audio waveforms for each track
 - Enable/disable individual audio tracks

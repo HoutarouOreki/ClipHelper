@@ -1,7 +1,11 @@
+#![allow(unused_assignments)]
+#![allow(dead_code)]
+
 mod core;
 mod gui;
 mod hotkeys;
 mod video;
+mod audio;
 
 use eframe::egui;
 use gui::ClipHelperApp;
