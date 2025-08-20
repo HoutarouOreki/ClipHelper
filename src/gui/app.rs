@@ -1061,7 +1061,7 @@ impl ClipHelperApp {
                 
                 // Action buttons
                 ui.horizontal(|ui| {
-                    if ui.button("✂️ Apply Trim").clicked() {
+                    if ui.button("✂ Apply Trim").clicked() {
                         if let Err(e) = self.apply_trim(false) {
                             log::error!("Failed to apply trim: {}", e);
                             self.status_message = format!("Error applying trim: {}", e);
@@ -1070,7 +1070,7 @@ impl ClipHelperApp {
                         }
                     }
                     
-                    if ui.button("🗑️ Delete").clicked() {
+                    if ui.button("🗑 Delete").clicked() {
                         if let Err(e) = self.delete_selected_clip() {
                             log::error!("Failed to delete clip: {}", e);
                             self.status_message = format!("Error deleting clip: {}", e);
