@@ -93,7 +93,7 @@ impl ThreadSafeVideoController {
             let mut pending_seek_position: Option<f64> = None; // Queue latest seek while restart in progress
             
             // Function to start continuous FFmpeg process for playback
-            fn start_continuous_ffmpeg(video_path: &PathBuf, start_position: f64, frame_rate: f64) -> Result<std::process::Child, String> {
+            fn start_continuous_ffmpeg(video_path: &PathBuf, start_position: f64, _frame_rate: f64) -> Result<std::process::Child, String> {
                 use std::process::{Command, Stdio};
                 
                 let process = Command::new("ffmpeg")
@@ -635,41 +635,101 @@ impl ThreadSafeAudioController {
         
         // Spawn audio thread - this thread owns the non-Send audio streams
         std::thread::spawn(move || {
-            let mut _audio_player: Option<SynchronizedAudioPlayer> = None;
+            let mut audio_player: Option<SynchronizedAudioPlayer> = None;
+            
+            // Helper function to get video duration using FFmpeg
+            fn get_video_duration(video_path: &PathBuf) -> Option<f64> {
+                let output = std::process::Command::new("ffprobe")
+                    .args([
+                        "-v", "quiet",
+                        "-show_entries", "format=duration",
+                        "-of", "csv=p=0",
+                        video_path.to_str()?
+                    ])
+                    .output()
+                    .ok()?;
+                
+                if output.status.success() {
+                    let duration_str = String::from_utf8(output.stdout).ok()?;
+                    duration_str.trim().parse::<f64>().ok()
+                } else {
+                    None
+                }
+            }
             
             for command in cmd_rx {
                 match command {
-                    AudioCommand::SetVideo(_path, _tracks) => {
-                        // In real implementation, create SynchronizedAudioPlayer here
-                        // For now, mock the behavior
-                        _audio_player = None; 
-                        let _ = status_tx.send(AudioStatus::Ready);
+                    AudioCommand::SetVideo(path, tracks) => {
+                        log::info!("Audio: Setting video to {:?} with {} tracks", path, tracks.len());
+                        
+                        // Create new audio player instance
+                        match SynchronizedAudioPlayer::new() {
+                            Ok(mut player) => {
+                                // Set the video with duration and audio tracks
+                                if let Some(duration) = get_video_duration(&path) {
+                                    player.set_video(path, duration, &tracks);
+                                    audio_player = Some(player);
+                                    let _ = status_tx.send(AudioStatus::Ready);
+                                    log::info!("Audio: Successfully set video with duration {:.2}s", duration);
+                                } else {
+                                    log::error!("Audio: Failed to get video duration");
+                                    let _ = status_tx.send(AudioStatus::Error("Failed to get video duration".to_string()));
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Audio: Failed to create audio player: {}", e);
+                                let _ = status_tx.send(AudioStatus::Error(format!("Failed to create audio player: {}", e)));
+                            }
+                        }
                     }
-                    AudioCommand::Play(_timestamp) => {
-                        // In real implementation: audio_player.play(timestamp)
-                        let _ = status_tx.send(AudioStatus::Playing);
+                    AudioCommand::Play(timestamp) => {
+                        log::info!("Audio: Starting playback at {:.2}s", timestamp);
+                        if let Some(ref mut player) = audio_player {
+                            player.seek(timestamp); // Seek to position first
+                            player.play(); // Then start playing
+                            let _ = status_tx.send(AudioStatus::Playing);
+                        } else {
+                            log::warn!("Audio: No audio player available for play command");
+                        }
                     }
                     AudioCommand::Pause => {
-                        // In real implementation: audio_player.pause()
-                        let _ = status_tx.send(AudioStatus::Paused);
+                        log::info!("Audio: Pausing playback");
+                        if let Some(ref mut player) = audio_player {
+                            player.pause();
+                            let _ = status_tx.send(AudioStatus::Paused);
+                        }
                     }
-                    AudioCommand::Seek(_timestamp) => {
-                        // In real implementation: audio_player.seek(timestamp)
-                        // No status update - maintains current playing state
+                    AudioCommand::Seek(timestamp) => {
+                        log::info!("Audio: Seeking to {:.2}s", timestamp);
+                        if let Some(ref mut player) = audio_player {
+                            player.seek(timestamp);
+                            // No status update - maintains current playing state
+                        }
                     }
-                    AudioCommand::UpdateTracks(_tracks) => {
-                        // In real implementation: audio_player.update_tracks(tracks)
+                    AudioCommand::UpdateTracks(tracks) => {
+                        log::info!("Audio: Updating tracks configuration");
+                        if let Some(ref mut player) = audio_player {
+                            player.update_audio_tracks(&tracks);
+                        }
                     }
                     AudioCommand::Stop => {
-                        // In real implementation: audio_player.stop()
-                        _audio_player = None;
+                        log::info!("Audio: Stopping playback");
+                        if let Some(ref mut player) = audio_player {
+                            player.stop();
+                        }
+                        audio_player = None;
                         let _ = status_tx.send(AudioStatus::Stopped);
                     }
                     AudioCommand::Shutdown => {
+                        log::info!("Audio: Shutting down audio thread");
+                        if let Some(ref mut player) = audio_player {
+                            player.stop();
+                        }
                         break;
                     }
                 }
             }
+            log::info!("Audio: Audio thread exiting");
         });
         
         Self {
@@ -895,7 +955,7 @@ impl MediaController {
         log::debug!("MediaController state changed to Seeking");
         
         // Coordinate both video and audio seeking
-        // Send command to audio thread
+        // Send command to audio thread first (it will pause/stop current playback)
         let _ = self.audio_controller.send_command(AudioCommand::Seek(sanitized_timestamp));
         
         // Send command to video thread
@@ -938,9 +998,16 @@ impl MediaController {
         }
         
         // Initialize both video and audio players
+        // Create audio tracks with first track enabled by default
+        let mut audio_tracks_with_first_enabled = audio_tracks.to_vec();
+        if !audio_tracks_with_first_enabled.is_empty() {
+            audio_tracks_with_first_enabled[0].enabled = true;
+            log::info!("Enabled first audio track: {}", audio_tracks_with_first_enabled[0].name);
+        }
+        
         // Send video setup command to audio thread
-        let _ = self.audio_controller.send_command(AudioCommand::SetVideo(video_path.clone(), audio_tracks.to_vec()));
-        log::debug!("Sent SetVideo command to audio thread");
+        let _ = self.audio_controller.send_command(AudioCommand::SetVideo(video_path.clone(), audio_tracks_with_first_enabled));
+        log::debug!("Sent SetVideo command to audio thread with first track enabled");
         
         // Send video setup command to video thread
         self.video_controller.send_command(VideoCommand::SetVideo(video_path.clone(), duration, self.video_frame_rate));

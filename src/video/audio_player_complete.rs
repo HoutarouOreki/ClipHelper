@@ -40,9 +40,110 @@ pub struct AudioTrackState {
 enum AudioCommand {
     Play(f64),
     Pause,
+    Resume,
     Seek(f64),
     Stop,
     UpdateTracks(Vec<AudioTrackState>),
+}
+
+// Streaming audio source that reads from FFmpeg process
+struct StreamingAudioSource {
+    sample_rate: u32,
+    channels: u16,
+    ffmpeg_process: Option<std::process::Child>,
+    buffer: Vec<f32>,
+    buffer_pos: usize,
+}
+
+impl StreamingAudioSource {
+    fn new(ffmpeg_process: std::process::Child) -> Self {
+        Self {
+            sample_rate: 48000,
+            channels: 2,
+            ffmpeg_process: Some(ffmpeg_process),
+            buffer: Vec::new(),
+            buffer_pos: 0,
+        }
+    }
+    
+    fn fill_buffer(&mut self) -> bool {
+        if let Some(ref mut process) = self.ffmpeg_process {
+            if let Some(stdout) = process.stdout.as_mut() {
+                let mut byte_buffer = vec![0u8; 8192]; // Read 8KB at a time
+                use std::io::Read;
+                
+                match stdout.read(&mut byte_buffer) {
+                    Ok(bytes_read) if bytes_read > 0 => {
+                        // Convert bytes to f32 samples
+                        self.buffer.clear();
+                        for chunk in byte_buffer[..bytes_read].chunks_exact(4) {
+                            if let Ok(array) = chunk.try_into() {
+                                let sample = f32::from_le_bytes(array);
+                                self.buffer.push(sample);
+                            }
+                        }
+                        self.buffer_pos = 0;
+                        return !self.buffer.is_empty();
+                    }
+                    _ => {
+                        // End of stream or error
+                        self.ffmpeg_process = None;
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+impl Iterator for StreamingAudioSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // If we've consumed the current buffer, try to fill it
+        if self.buffer_pos >= self.buffer.len() {
+            if !self.fill_buffer() {
+                return None; // No more data
+            }
+        }
+        
+        // Return next sample from buffer
+        if self.buffer_pos < self.buffer.len() {
+            let sample = self.buffer[self.buffer_pos];
+            self.buffer_pos += 1;
+            Some(sample)
+        } else {
+            None
+        }
+    }
+}
+
+impl Source for StreamingAudioSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None // Unknown length for streaming
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None // Unknown duration for streaming
+    }
+}
+
+impl Drop for StreamingAudioSource {
+    fn drop(&mut self) {
+        if let Some(mut process) = self.ffmpeg_process.take() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
 }
 
 // Simple audio source that generates mixed audio from FFmpeg output
@@ -134,6 +235,8 @@ impl SynchronizedAudioPlayer {
         let mut current_sink: Option<Arc<Mutex<Sink>>> = None;
         let mut _current_stream: Option<OutputStream> = None;
         let mut current_position = 0.0;
+        let mut is_playing = false;
+        let mut ffmpeg_process: Option<std::process::Child> = None;
         
         // Create audio output stream once
         let (stream, stream_handle) = match OutputStream::try_default() {
@@ -150,80 +253,137 @@ impl SynchronizedAudioPlayer {
                 Ok(AudioCommand::Play(start_time)) => {
                     log::debug!("Audio: Starting playback from {:.2}s", start_time);
                     current_position = start_time;
+                    is_playing = true;
                     
                     // Stop current playback
                     current_sink = None;
+                    if let Some(mut process) = ffmpeg_process.take() {
+                        let _ = process.kill();
+                        let _ = process.wait();
+                    }
 
-                    // Create new sink and start playing mixed audio
-                    match Sink::try_new(&stream_handle) {
-                        Ok(sink) => {
-                            // Generate mixed audio source
-                            if let Some(audio_source) = Self::create_mixed_audio_source(&video_path, &audio_tracks, start_time) {
-                                sink.append(audio_source);
+                    // Start streaming audio from FFmpeg
+                    if let Some(streaming_source) = Self::start_streaming_audio_ffmpeg(&video_path, &audio_tracks, start_time) {
+                        // Create sink and add the streaming source
+                        match Sink::try_new(&stream_handle) {
+                            Ok(sink) => {
+                                sink.append(streaming_source);
                                 sink.play();
                                 current_sink = Some(Arc::new(Mutex::new(sink)));
+                                log::debug!("Audio: Started streaming audio from {:.2}s", start_time);
                             }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to create audio sink: {}", e);
+                            Err(e) => {
+                                log::error!("Failed to create audio sink: {}", e);
+                            }
                         }
                     }
                 }
                 Ok(AudioCommand::Pause) => {
                     log::debug!("Audio: Pausing playback");
+                    is_playing = false;
                     if let Some(ref sink) = current_sink {
                         if let Ok(sink_guard) = sink.lock() {
                             sink_guard.pause();
                         }
+                    }
+                    // Kill FFmpeg process when pausing
+                    if let Some(mut process) = ffmpeg_process.take() {
+                        let _ = process.kill();
+                        let _ = process.wait();
                     }
                 }
                 Ok(AudioCommand::Seek(timestamp)) => {
                     log::debug!("Audio: Seeking to {:.2}s", timestamp);
                     current_position = timestamp;
                     
-                    // Stop current audio and restart from new position
-                    current_sink = None;
+                    if is_playing {
+                        // Stop current playback
+                        current_sink = None;
+                        if let Some(mut process) = ffmpeg_process.take() {
+                            let _ = process.kill();
+                            let _ = process.wait();
+                        }
+                        
+                        // Start new streaming audio from seek position
+                        if let Some(streaming_source) = Self::start_streaming_audio_ffmpeg(&video_path, &audio_tracks, timestamp) {
+                            match Sink::try_new(&stream_handle) {
+                                Ok(sink) => {
+                                    sink.append(streaming_source);
+                                    sink.play();
+                                    current_sink = Some(Arc::new(Mutex::new(sink)));
+                                    log::debug!("Audio: Restarted streaming from seek position {:.2}s", timestamp);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to create audio sink after seek: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(AudioCommand::Stop) => {
                     log::debug!("Audio: Stopping playback");
+                    is_playing = false;
                     current_sink = None;
+                    if let Some(mut process) = ffmpeg_process.take() {
+                        let _ = process.kill();
+                        let _ = process.wait();
+                    }
                     break;
+                }
+                Ok(AudioCommand::Resume) => {
+                    log::debug!("Audio: Resuming playback");
+                    is_playing = true;
+                    
+                    // Restart streaming from current position
+                    if let Some(streaming_source) = Self::start_streaming_audio_ffmpeg(&video_path, &audio_tracks, current_position) {
+                        match Sink::try_new(&stream_handle) {
+                            Ok(sink) => {
+                                sink.append(streaming_source);
+                                sink.play();
+                                current_sink = Some(Arc::new(Mutex::new(sink)));
+                                log::debug!("Audio: Resumed streaming from {:.2}s", current_position);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to create audio sink on resume: {}", e);
+                            }
+                        }
+                    }
                 }
                 Ok(AudioCommand::UpdateTracks(new_tracks)) => {
                     log::debug!("Audio: Updating track configuration");
                     audio_tracks = new_tracks;
                     
                     // If currently playing, restart with new track configuration
-                    let should_restart = if let Some(ref sink) = current_sink {
-                        if let Ok(sink_guard) = sink.lock() {
-                            !sink_guard.is_paused()
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    
-                    if should_restart {
+                    if is_playing {
                         current_sink = None;
+                        if let Some(mut process) = ffmpeg_process.take() {
+                            let _ = process.kill();
+                            let _ = process.wait();
+                        }
                         
-                        match Sink::try_new(&stream_handle) {
-                            Ok(new_sink) => {
-                                if let Some(audio_source) = Self::create_mixed_audio_source(&video_path, &audio_tracks, current_position) {
-                                    new_sink.append(audio_source);
-                                    new_sink.play();
-                                    current_sink = Some(Arc::new(Mutex::new(new_sink)));
+                        if let Some(streaming_source) = Self::start_streaming_audio_ffmpeg(&video_path, &audio_tracks, current_position) {
+                            match Sink::try_new(&stream_handle) {
+                                Ok(sink) => {
+                                    sink.append(streaming_source);
+                                    sink.play();
+                                    current_sink = Some(Arc::new(Mutex::new(sink)));
+                                    log::debug!("Audio: Restarted with new track configuration");
                                 }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to restart audio with new tracks: {}", e);
+                                Err(e) => {
+                                    log::error!("Failed to restart audio with new tracks: {}", e);
+                                }
                             }
                         }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Continue loop - prevents hanging
-                    continue;
+                    // Update position if playing
+                    if is_playing {
+                        current_position += 0.05; // 50ms increment
+                        
+                        // The streaming source will naturally end when the video ends
+                        // So we don't need to manually check total_duration here
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     log::debug!("Audio: Command receiver disconnected");
@@ -232,7 +392,89 @@ impl SynchronizedAudioPlayer {
             }
         }
         
+        // Cleanup
+        if let Some(mut process) = ffmpeg_process.take() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+        
         log::debug!("Audio: Processing thread exiting cleanly");
+    }
+
+    fn start_streaming_audio_ffmpeg(
+        video_path: &PathBuf,
+        audio_tracks: &[AudioTrackState],
+        start_time: f64
+    ) -> Option<StreamingAudioSource> {
+        use std::process::{Command, Stdio};
+        
+        let enabled_tracks: Vec<_> = audio_tracks.iter().filter(|t| t.enabled).collect();
+        
+        if enabled_tracks.is_empty() {
+            log::warn!("No enabled audio tracks for streaming playback");
+            return None;
+        }
+        
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-ss").arg(start_time.to_string())
+            .arg("-i").arg(video_path);
+        
+        // Build filter complex for mixing
+        if enabled_tracks.len() == 1 {
+            let track = enabled_tracks[0];
+            if track.surround_mode {
+                cmd.arg("-filter_complex")
+                    .arg(format!("[0:a:{}]channelmap=map=FL|FR[mixed]", track.index))
+                    .arg("-map").arg("[mixed]");
+            } else {
+                cmd.arg("-map").arg(format!("0:a:{}", track.index));
+            }
+        } else {
+            // Multiple tracks - need to mix them
+            let mut filter_parts = Vec::new();
+            let mut mix_inputs = Vec::new();
+            
+            for (i, track) in enabled_tracks.iter().enumerate() {
+                if track.surround_mode {
+                    filter_parts.push(format!("[0:a:{}]channelmap=map=FL|FR[a{}]", track.index, i));
+                    mix_inputs.push(format!("[a{}]", i));
+                } else {
+                    mix_inputs.push(format!("[0:a:{}]", track.index));
+                }
+            }
+            
+            let filter_complex = if filter_parts.is_empty() {
+                format!("{}amix=inputs={}[mixed]", mix_inputs.join(""), enabled_tracks.len())
+            } else {
+                format!("{};{}amix=inputs={}[mixed]", 
+                    filter_parts.join(";"),
+                    mix_inputs.join(""),
+                    enabled_tracks.len())
+            };
+            
+            cmd.arg("-filter_complex").arg(&filter_complex)
+                .arg("-map").arg("[mixed]");
+        }
+        
+        // Output as continuous raw audio stream
+        cmd.arg("-f").arg("f32le")
+            .arg("-ac").arg("2")
+            .arg("-ar").arg("48000")
+            .arg("-loglevel").arg("error")
+            .arg("pipe:1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        
+        match cmd.spawn() {
+            Ok(process) => {
+                log::debug!("Started streaming FFmpeg audio process from {:.2}s", start_time);
+                Some(StreamingAudioSource::new(process))
+            }
+            Err(e) => {
+                log::error!("Failed to spawn streaming FFmpeg audio process: {}", e);
+                None
+            }
+        }
     }
 
     fn create_mixed_audio_source(
@@ -364,6 +606,13 @@ impl SynchronizedAudioPlayer {
         self.is_playing = false;
         if let Some(ref sender) = self.command_sender {
             let _ = sender.send(AudioCommand::Pause);
+        }
+    }
+
+    pub fn resume(&mut self) {
+        self.is_playing = true;
+        if let Some(ref sender) = self.command_sender {
+            let _ = sender.send(AudioCommand::Resume);
         }
     }
 
