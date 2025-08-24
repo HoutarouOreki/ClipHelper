@@ -28,6 +28,8 @@ use std::process::{Command, Stdio};
 use std::io::Read;
 use egui::{ColorImage, Context, TextureHandle};
 use log;
+use crate::video::audio_player_complete::SynchronizedAudioPlayer;
+use crate::core::clip::AudioTrack;
 
 pub struct EmbeddedVideoPlayer {
     video_path: Option<PathBuf>,
@@ -41,6 +43,7 @@ pub struct EmbeddedVideoPlayer {
     last_seek_time: f64,
     seek_threshold: f64, // Only seek if time difference is larger than this
     current_sequence: u64, // Track current seek sequence to ignore outdated frames
+    audio_player: Option<SynchronizedAudioPlayer>, // Synchronized audio playback
 }
 
 #[derive(Debug)]
@@ -74,14 +77,27 @@ impl EmbeddedVideoPlayer {
             last_seek_time: 0.0,
             seek_threshold: 0.01, // Very small threshold since we now have instant frame extraction
             current_sequence: 0,
+            audio_player: None,
         }
     }
 
-    pub fn set_video(&mut self, video_path: PathBuf, duration: f64) {
+    pub fn set_video(&mut self, video_path: PathBuf, duration: f64, audio_tracks: &[AudioTrack]) {
         self.stop();
         self.video_path = Some(video_path.clone());
         self.total_duration = duration;
         self.current_time = 0.0;
+        
+        // Initialize audio player
+        match SynchronizedAudioPlayer::new() {
+            Ok(mut audio_player) => {
+                audio_player.set_video(video_path.clone(), duration, audio_tracks);
+                self.audio_player = Some(audio_player);
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize audio player: {}", e);
+                self.audio_player = None;
+            }
+        }
         
         // Start background video processing thread
         self.start_video_thread(video_path);
@@ -158,7 +174,15 @@ impl EmbeddedVideoPlayer {
                         should_play = true;
                         seeking = false; // Clear seeking state
                         last_frame_time = Instant::now();
-                        // DO NOT restart stream - just update position
+                        
+                        // Check if stream exists, restart if needed
+                        if ffmpeg_stream.is_none() {
+                            current_sequence += 1; // Increment sequence for new stream
+                            ffmpeg_stream = Self::start_ffmpeg_stream(&video_path, current_position, display_width, display_height).ok();
+                            stream_start_position = current_position;
+                            frame_count = 0;
+                            log::debug!("Stream restarted for resume from position {:.3}s (sequence {})", current_position, current_sequence);
+                        }
                     }
                     PlaybackCommand::Pause => {
                         should_play = false;
@@ -412,12 +436,22 @@ impl EmbeddedVideoPlayer {
             let _ = sender.send(PlaybackCommand::Play(self.current_time));
             self.is_playing = true;
         }
+        
+        // Start synchronized audio playback
+        if let Some(ref mut audio_player) = self.audio_player {
+            audio_player.play();
+        }
     }
 
     pub fn pause(&mut self) {
         if let Some(sender) = &self.frame_sender {
             let _ = sender.send(PlaybackCommand::Pause);
             self.is_playing = false;
+        }
+        
+        // Pause synchronized audio
+        if let Some(ref mut audio_player) = self.audio_player {
+            audio_player.pause();
         }
     }
 
@@ -508,6 +542,13 @@ impl EmbeddedVideoPlayer {
 
     pub fn total_duration(&self) -> f64 {
         self.total_duration
+    }
+
+    // Method to update audio track configuration in real-time
+    pub fn update_audio_tracks(&mut self, audio_tracks: &[AudioTrack]) {
+        if let Some(ref mut audio_player) = self.audio_player {
+            audio_player.update_audio_tracks(audio_tracks);
+        }
     }
 }
 

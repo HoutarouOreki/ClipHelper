@@ -247,7 +247,7 @@ impl ClipHelperApp {
                     
                     // Initialize embedded video player for the selected clip
                     let mut player = crate::video::EmbeddedVideoPlayer::new();
-                    player.set_video(clip.original_file.clone(), duration);
+                    player.set_video(clip.original_file.clone(), duration, &clip.audio_tracks);
                     // Start paused - will be controlled by play button
                     self.embedded_video_player = Some(player);
                 } else {
@@ -1351,7 +1351,7 @@ impl ClipHelperApp {
                     
                     // Get current video frame as texture
                     if let Some(frame_texture) = player.update(ui.ctx()) {
-                        log::debug!("Got frame texture with size {:?}", frame_texture.size_vec2());
+                        log::trace!("Got frame texture with size {:?}", frame_texture.size_vec2());
                         
                         // Display video frame - scale to fill container while preserving aspect ratio
                         let img_size = frame_texture.size_vec2();
@@ -1653,11 +1653,31 @@ impl ClipHelperApp {
         ui.heading("Audio Tracks");
         
         if let Some(clip) = self.get_selected_clip_mut() {
+            let mut audio_changed = false;
+            
             for track in &mut clip.audio_tracks {
                 ui.horizontal(|ui| {
+                    let old_enabled = track.enabled;
+                    let old_surround = track.surround_mode;
+                    
                     ui.checkbox(&mut track.enabled, &track.name);
                     ui.checkbox(&mut track.surround_mode, "Surround L/R");
+                    
+                    // Check if settings changed
+                    if track.enabled != old_enabled || track.surround_mode != old_surround {
+                        audio_changed = true;
+                    }
                 });
+            }
+            
+            // Clone audio tracks to avoid borrowing conflicts
+            if audio_changed {
+                let audio_tracks = clip.audio_tracks.clone();
+                
+                // Update embedded video player audio configuration if settings changed
+                if let Some(ref mut player) = self.embedded_video_player {
+                    player.update_audio_tracks(&audio_tracks);
+                }
             }
         }
     }
