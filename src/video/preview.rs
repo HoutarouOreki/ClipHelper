@@ -91,6 +91,13 @@ impl VideoPreview {
         }
     }
 
+    /// Update position without restarting playback (for sync purposes)
+    pub fn sync_position(&mut self, time: f64) {
+        let new_time = time.clamp(0.0, self.total_duration);
+        self.current_time = new_time;
+        // Don't request thumbnail or restart playback for sync updates
+    }
+
     pub fn skip_forward(&mut self, seconds: f64) {
         self.seek_to(self.current_time + seconds);
     }
@@ -102,9 +109,11 @@ impl VideoPreview {
     pub fn play(&mut self) {
         // For embedded playback, we'll request continuous thumbnails during playback
         // rather than using external processes
-        self.is_playing = true;
-        self.request_thumbnail_for_current_time();
-        log::info!("Started embedded video playback at {:.3}s", self.current_time);
+        if !self.is_playing {
+            self.is_playing = true;
+            self.request_thumbnail_for_current_time();
+            log::info!("Started embedded video playback at {:.3}s", self.current_time);
+        }
     }
 
     pub fn pause(&mut self) {

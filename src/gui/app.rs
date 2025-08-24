@@ -65,8 +65,8 @@ pub struct ClipHelperApp {
     pub audio_confirmation: Option<AudioConfirmation>,
     /// Smart thumbnail cache for video preview
     pub smart_thumbnail_cache: Option<Arc<crate::video::SmartThumbnailCache>>,
-    /// Embedded video player for in-UI playback
-    pub embedded_video_player: Option<crate::video::EmbeddedVideoPlayer>,
+    /// New thread-safe media controller for in-UI playback
+    pub media_controller: Option<Arc<std::sync::Mutex<crate::video::MediaController>>>,
 }
 
 impl ClipHelperApp {
@@ -176,7 +176,7 @@ impl ClipHelperApp {
             initial_scan_completed: false,
             audio_confirmation,
             smart_thumbnail_cache,
-            embedded_video_player: None,
+            media_controller: None,
         };
 
         // Don't load saved clips here - we'll apply saved config after scanning files
@@ -203,12 +203,10 @@ impl ClipHelperApp {
                 preview.stop();
             }
             
-            // Stop any existing embedded video player properly
-            if let Some(mut player) = self.embedded_video_player.take() {
-                log::debug!("Stopping existing embedded video player");
-                player.stop();
-                // Give it a moment to fully stop
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            // Stop any existing media controller properly
+            if let Some(_controller) = self.media_controller.take() {
+                log::debug!("Stopping existing media controller");
+                // MediaController drops automatically and cleans up threads
             }
             
             self.selected_clip_index = Some(index);
@@ -245,14 +243,48 @@ impl ClipHelperApp {
                     
                     self.video_preview = Some(preview);
                     
-                    // Initialize embedded video player for the selected clip
-                    let mut player = crate::video::EmbeddedVideoPlayer::new();
-                    player.set_video(clip.original_file.clone(), duration, &clip.audio_tracks);
-                    // Start paused - will be controlled by play button
-                    self.embedded_video_player = Some(player);
+                    // Create media controller - video will be set when we have egui context
+                    let controller = Arc::new(std::sync::Mutex::new(crate::video::MediaController::new()));
+                    self.media_controller = Some(controller);
+                    log::info!("Created MediaController for clip: {}", clip.get_output_filename());
                 } else {
                     // Video info not loaded yet, create basic preview
                     self.video_preview = Some(VideoPreview::new(clip.trim_end));
+                }
+            }
+        }
+    }
+    
+    /// Initialize MediaController with video file if needed
+    fn initialize_media_controller_if_needed(&mut self, ctx: &egui::Context) {
+        // Check if we have a MediaController that hasn't been initialized with a video yet
+        if let Some(ref controller_arc) = self.media_controller {
+            if let Ok(mut controller) = controller_arc.lock() {
+                // Check if controller is in Unloaded state (needs video)
+                if matches!(controller.state(), crate::video::MediaControllerState::Unloaded) {
+                    // Get current clip info to initialize controller
+                    if let Some(clip_index) = self.selected_clip_index {
+                        if let Some(clip) = self.clips.get(clip_index) {
+                            if let Some(duration) = clip.video_length_seconds {
+                                log::info!("Initializing MediaController with video: {} (duration: {:.2}s)", 
+                                    clip.get_output_filename(), duration);
+                                
+                                // Set video in MediaController
+                                if let Err(e) = controller.set_video(
+                                    clip.original_file.clone(), 
+                                    &clip.audio_tracks, 
+                                    duration,  // Pass the actual video duration!
+                                    ctx
+                                ) {
+                                    log::error!("Failed to set video in MediaController: {}", e);
+                                } else {
+                                    log::info!("Successfully initialized MediaController with video");
+                                }
+                            } else {
+                                log::debug!("Clip video info not yet loaded, skipping MediaController initialization");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -820,6 +852,9 @@ impl eframe::App for ClipHelperApp {
         // Perform initial file scan if not done yet (non-blocking after UI is shown)
         self.perform_initial_scan();
         
+        // Initialize MediaController with video if needed
+        self.initialize_media_controller_if_needed(ctx);
+        
         // Process events
         self.process_hotkey_events();
         self.process_file_events();
@@ -1315,9 +1350,11 @@ impl ClipHelperApp {
             if preview.is_playing {
                 let now = std::time::Instant::now();
                 if now.duration_since(self.last_video_info_check).as_millis() > 33 { // ~30 FPS updates
-                    // Sync with embedded player if available
-                    if let Some(ref player) = self.embedded_video_player {
-                        preview.seek_to(player.current_time());
+                    // Sync with media controller if available
+                    if let Some(ref controller) = self.media_controller {
+                        if let Ok(ctrl) = controller.lock() {
+                            preview.sync_position(ctrl.current_time()); // Use sync_position, not seek_to!
+                        }
                     } else {
                         preview.update_time(0.033); // 33ms for smooth updates
                     }
@@ -1339,22 +1376,28 @@ impl ClipHelperApp {
             ui.allocate_ui_at_rect(container_rect, |ui| {
                 ui.set_clip_rect(container_rect);
                 
-                // Check if we have embedded video player with current frame
-                if let Some(ref mut player) = self.embedded_video_player {
-                    // Only update player position if it's significantly different or for user interactions
-                    // This prevents constant FFmpeg restarts and maintains smooth playback
-                    let time_diff = (preview.current_time - player.current_time()).abs();
-                    if time_diff > 0.1 {
-                        log::debug!("Significant time difference {:.2}s, seeking to {:.1}s", time_diff, preview.current_time);
-                        player.seek(preview.current_time);
-                    }
-                    
-                    // Get current video frame as texture
-                    if let Some(frame_texture) = player.update(ui.ctx()) {
-                        log::trace!("Got frame texture with size {:?}", frame_texture.size_vec2());
+                // Check if we have media controller with current frame
+                if let Some(ref controller) = self.media_controller {
+                    if let Ok(mut ctrl) = controller.lock() {
+                        // Only update player position if it's significantly different or for user interactions
+                        // This prevents constant FFmpeg restarts and maintains smooth playback
+                        let time_diff = (preview.current_time - ctrl.current_time()).abs();
+                        if time_diff > 0.1 {
+                            log::debug!("Significant time difference {:.2}s detected between preview ({:.1}s) and controller ({:.1}s) - NOT auto-seeking to prevent feedback loop", 
+                                time_diff, preview.current_time, ctrl.current_time());
+                            // DISABLED: ctrl.seek(preview.current_time); 
+                            // This was causing automatic seeks that created feedback loops
+                        }
                         
-                        // Display video frame - scale to fill container while preserving aspect ratio
-                        let img_size = frame_texture.size_vec2();
+                        // Update media controller for frame processing
+                        ctrl.update(ui.ctx());
+                        
+                        // Get current video frame as texture (currently returns None in mock mode)
+                        if let Some(frame_texture) = ctrl.get_frame_texture(ui.ctx()) {
+                            log::trace!("Got frame texture with size {:?}", frame_texture.size_vec2());
+                            
+                            // Display video frame - scale to fill container while preserving aspect ratio
+                            let img_size = frame_texture.size_vec2();
                         
                         // Calculate scale to fill container (use min to ensure it fits within bounds)
                         let scale_x = container_size.x / img_size.x;
@@ -1368,7 +1411,7 @@ impl ClipHelperApp {
                         let video_rect = egui::Rect::from_min_size(video_pos, display_size);
                         
                         ui.allocate_ui_at_rect(video_rect, |ui| {
-                            ui.add(egui::Image::from_texture(frame_texture)
+                            ui.add(egui::Image::from_texture(egui::load::SizedTexture::from_handle(&frame_texture))
                                 .fit_to_exact_size(display_size));
                         });
                         
@@ -1382,13 +1425,14 @@ impl ClipHelperApp {
                                 });
                             }
                         );
-                    } else {
-                        log::debug!("No frame texture available from embedded player");
-                        // No video frame ready yet - show loading in center
-                        ui.centered_and_justified(|ui| {
-                            ui.label("Loading video frame...");
-                        });
-                    }
+                        } else {
+                            log::debug!("No frame texture available from media controller");
+                            // No video frame ready yet - show loading in center
+                            ui.centered_and_justified(|ui| {
+                                ui.label("Loading video frame...");
+                            });
+                        }
+                    } // Close the controller.lock() scope
                 } else {
                     log::debug!("No embedded video player available, falling back to thumbnails");
                     
@@ -1440,8 +1484,8 @@ impl ClipHelperApp {
             });
             
             // Process status - show embedded player status or fallback to preview
-            if let Some(ref player) = self.embedded_video_player {
-                if preview.is_playing && !player.is_playing() {
+            if let Some(ref controller) = self.media_controller {
+                if preview.is_playing && !controller.lock().unwrap().is_playing() {
                     ui.label("⚠ Embedded video playback stopped");
                 }
             } else if preview.is_playing && !preview.is_process_alive() {
@@ -1463,33 +1507,33 @@ impl ClipHelperApp {
                 // If user interacted with timeline, handle seeking appropriately
                 if timeline_response.clicked() {
                     // Immediate seek for clicks
-                    if let Some(ref mut player) = self.embedded_video_player {
+                    if let Some(ref controller) = self.media_controller {
                         if let Some(preview) = &mut self.video_preview {
                             log::debug!("Timeline click - forcing immediate seek to {:.2}s", preview.current_time);
                             let seek_time = preview.current_time;
-                            player.seek_immediate(seek_time);
+                            controller.lock().unwrap().seek_immediate(seek_time);
                             // Immediately update preview to prevent position jumping
                             preview.seek_to(seek_time);
                         }
                     }
                 } else if timeline_response.dragged() {
                     // During drag, just show preview without restarting stream
-                    if let Some(ref mut player) = self.embedded_video_player {
+                    if let Some(ref controller) = self.media_controller {
                         if let Some(preview) = &mut self.video_preview {
                             let seek_time = preview.current_time;
                             // Use regular seek (no stream restart) during drag for smooth preview
-                            player.seek(seek_time);
+                            controller.lock().unwrap().seek(seek_time);
                             // Keep preview in sync during drag
                             preview.seek_to(seek_time);
                         }
                     }
                 } else if timeline_response.drag_stopped() {
                     // When drag ends, do immediate seek to final position
-                    if let Some(ref mut player) = self.embedded_video_player {
+                    if let Some(ref controller) = self.media_controller {
                         if let Some(preview) = &mut self.video_preview {
                             log::debug!("Timeline drag released - forcing immediate seek to {:.2}s", preview.current_time);
                             let seek_time = preview.current_time;
-                            player.seek_immediate(seek_time);
+                            controller.lock().unwrap().seek_immediate(seek_time);
                             // Immediately update preview to prevent position jumping
                             preview.seek_to(seek_time);
                         }
@@ -1506,9 +1550,9 @@ impl ClipHelperApp {
             if ui.button("⏮ Start").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.goto_start();
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
@@ -1516,9 +1560,9 @@ impl ClipHelperApp {
             if ui.button("⏪ -10s").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_backward(10.0);
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
@@ -1526,9 +1570,9 @@ impl ClipHelperApp {
             if ui.button("⏪ -5s").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_backward(5.0);
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
@@ -1536,24 +1580,28 @@ impl ClipHelperApp {
             if ui.button("⏪ -3s").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_backward(3.0);
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
             
             if let Some(preview) = &mut self.video_preview {
                 if ui.button(if preview.is_playing { "⏸" } else { "▶" }).clicked() {
+                    let was_playing = preview.is_playing;
                     preview.toggle_playback();
                     
-                    // Sync embedded video player playback state
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        if preview.is_playing {
-                            player.play();
-                        } else {
-                            player.pause();
+                    // Sync media controller playback state - only send command if state actually changed
+                    if let Some(ref controller) = self.media_controller {
+                        if !was_playing && preview.is_playing {
+                            // Started playing
+                            controller.lock().unwrap().play();
+                        } else if was_playing && !preview.is_playing {
+                            // Stopped playing
+                            controller.lock().unwrap().pause();
                         }
+                        // If state didn't change, don't send redundant commands
                     }
                 }
             }
@@ -1561,9 +1609,9 @@ impl ClipHelperApp {
             if ui.button("3s ⏩").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_forward(3.0);
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
@@ -1571,9 +1619,9 @@ impl ClipHelperApp {
             if ui.button("5s ⏩").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_forward(5.0);
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
@@ -1581,9 +1629,9 @@ impl ClipHelperApp {
             if ui.button("10s ⏩").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.skip_forward(10.0);
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
@@ -1591,9 +1639,9 @@ impl ClipHelperApp {
             if ui.button("Last 5s ⏭").clicked() {
                 if let Some(preview) = &mut self.video_preview {
                     preview.goto_last_5_seconds();
-                    // Force immediate seek on embedded player
-                    if let Some(ref mut player) = self.embedded_video_player {
-                        player.seek_immediate(preview.current_time);
+                    // Force immediate seek on media controller
+                    if let Some(ref controller) = self.media_controller {
+                        controller.lock().unwrap().seek_immediate(preview.current_time);
                     }
                 }
             }
@@ -1674,9 +1722,9 @@ impl ClipHelperApp {
             if audio_changed {
                 let audio_tracks = clip.audio_tracks.clone();
                 
-                // Update embedded video player audio configuration if settings changed
-                if let Some(ref mut player) = self.embedded_video_player {
-                    player.update_audio_tracks(&audio_tracks);
+                // Update media controller audio configuration if settings changed
+                if let Some(ref controller) = self.media_controller {
+                    controller.lock().unwrap().update_audio_tracks(&audio_tracks);
                 }
             }
         }

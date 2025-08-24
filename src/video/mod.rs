@@ -10,5 +10,5 @@ pub use processor::*;
 pub use preview::*;
 pub use waveform::*;
 pub use smart_thumbnail::*;
-pub use embedded_player::*;
+// pub use embedded_player::*;  // Replaced by MediaController
 pub use media_controller::*;

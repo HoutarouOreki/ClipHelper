@@ -38,7 +38,7 @@ mod tests {
             audio_confirmation: None,
             last_thumbnail_processing: std::time::Instant::now(),
             smart_thumbnail_cache: None,
-            embedded_video_player: None,
+            media_controller: None,
         }
     }
 
@@ -49,7 +49,7 @@ mod tests {
         // Check that new fields are properly initialized
         assert!(!app.config.use_system_file_dialog);
         assert!(!app.config.audio_confirmation.duration_confirmation_enabled);
-        assert!(app.embedded_video_player.is_none());
+        assert!(app.media_controller.is_none());
         assert!(!app.show_sound_file_browser);
         assert_eq!(app.file_browser_path, PathBuf::from("C:\\"));
     }
