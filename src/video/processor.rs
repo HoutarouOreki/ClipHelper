@@ -143,7 +143,7 @@ impl VideoProcessor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VideoInfo {
     pub duration: f64,
     pub audio_tracks: Vec<crate::core::AudioTrack>,

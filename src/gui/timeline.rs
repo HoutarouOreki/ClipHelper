@@ -22,7 +22,7 @@ impl TimelineWidget {
         let duration = if let Some(preview) = video_preview {
             preview.total_duration
         } else {
-            clip.duration_seconds as f64
+            clip.target_duration_seconds as f64
         };
         let trim_start = clip.trim_start;
         let trim_end = clip.trim_end;
@@ -157,11 +157,9 @@ impl TimelineWidget {
                             // Clicked end handle
                             self.is_scrubbing = true;
                         } else {
-                            // Clicked timeline - seek with immediate thumbnail
+                            // Clicked timeline - just update position for display
                             if let Some(preview) = video_preview {
-                                preview.seek_to(clicked_time);
-                                // Request immediate thumbnail for responsive clicking
-                                preview.request_thumbnail_immediate();
+                                preview.current_time = clicked_time;
                             }
                             self.scrub_position = clicked_time;
                         }
@@ -185,11 +183,9 @@ impl TimelineWidget {
                                 clip.trim_end = clamped_time.max(trim_start + 0.1);
                             }
                         } else {
-                            // Timeline scrubbing - seek to dragged position
+                            // Timeline scrubbing - just update position for display
                             if let Some(preview) = video_preview {
-                                preview.seek_to(clicked_time);
-                                // Request immediate thumbnail for responsive scrubbing
-                                preview.request_thumbnail_immediate();
+                                preview.current_time = clicked_time;
                             }
                             self.scrub_position = clicked_time;
                         }

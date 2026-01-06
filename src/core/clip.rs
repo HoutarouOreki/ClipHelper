@@ -7,7 +7,7 @@ pub struct Clip {
     pub id: String,
     pub original_file: PathBuf,
     pub timestamp: DateTime<Local>,
-    pub duration_seconds: u32, // Target duration (from hotkey)
+    pub target_duration_seconds: u32, // Target duration (from hotkey)
     pub video_length_seconds: Option<f64>, // Actual video file duration
     pub name: Option<String>,
     pub trim_start: f64, // seconds from start
@@ -37,17 +37,17 @@ pub enum ClipDuration {
 impl Clip {
     pub fn new(file: PathBuf, duration: ClipDuration) -> anyhow::Result<Self> {
         let timestamp = Self::extract_timestamp_from_filename(&file)?;
-        let duration_seconds = duration as u32;
+        let target_duration_seconds = duration as u32;
         
         Ok(Clip {
             id: uuid::Uuid::new_v4().to_string(),
             original_file: file,
             timestamp,
-            duration_seconds,
+            target_duration_seconds,
             video_length_seconds: None, // Will be populated later when needed
             name: None,
             trim_start: 0.0,
-            trim_end: duration_seconds as f64,
+            trim_end: target_duration_seconds as f64,
             audio_tracks: Vec::new(),
             is_deleted: false,
             is_trimmed: false,
@@ -61,7 +61,7 @@ impl Clip {
             id: uuid::Uuid::new_v4().to_string(),
             original_file: file,
             timestamp,
-            duration_seconds: 0, // No target duration
+            target_duration_seconds: 0, // No target duration
             video_length_seconds: None, // Will be populated later when needed
             name: None,
             trim_start: 0.0,
@@ -131,7 +131,7 @@ impl Clip {
 
     /// Checks if this clip has a valid target duration set (> 0 seconds)
     pub fn has_target_duration(&self) -> bool {
-        self.duration_seconds > 0
+        self.target_duration_seconds > 0
     }
 
     /// Checks if the video file is valid (duration >= 1 second)
@@ -157,13 +157,13 @@ impl Clip {
     /// This is called when a hotkey assigns a specific duration to the clip
     /// The trim will be set to capture the LAST X seconds of the video
     pub fn set_target_duration(&mut self, duration: ClipDuration) {
-        self.duration_seconds = duration as u32;
+        self.target_duration_seconds = duration as u32;
         
         // If we have video length info, set trim to capture last X seconds
         // Otherwise, we'll update the trim when video info becomes available
         if let Some(video_length) = self.video_length_seconds {
             if video_length >= 1.0 {
-                let target_seconds = self.duration_seconds as f64;
+                let target_seconds = self.target_duration_seconds as f64;
                 // Trim to last X seconds: start = video_length - target, end = video_length
                 self.trim_start = (video_length - target_seconds).max(0.0);
                 self.trim_end = video_length;
@@ -191,7 +191,7 @@ impl Clip {
                 // Set trim points based on whether we have a target duration
                 if self.has_target_duration() {
                     // Trim to last X seconds of the video
-                    let target_seconds = self.duration_seconds as f64;
+                    let target_seconds = self.target_duration_seconds as f64;
                     self.trim_start = (video_info.duration - target_seconds).max(0.0);
                     self.trim_end = video_info.duration;
                 } else if self.trim_end == 0.0 {
@@ -228,7 +228,7 @@ mod tests {
         
         assert!(clip.is_ok());
         let clip = clip.unwrap();
-        assert_eq!(clip.duration_seconds, 30);
+        assert_eq!(clip.target_duration_seconds, 30);
         assert_eq!(clip.trim_start, 0.0);
         assert_eq!(clip.trim_end, 30.0);
         assert_eq!(clip.original_file, file_path);
@@ -301,7 +301,7 @@ mod tests {
         
         assert!(clip.is_ok());
         let clip = clip.unwrap();
-        assert_eq!(clip.duration_seconds, 0);
+        assert_eq!(clip.target_duration_seconds, 0);
         assert!(!clip.has_target_duration());
         assert_eq!(clip.trim_start, 0.0);
         assert_eq!(clip.trim_end, 0.0);
@@ -319,7 +319,7 @@ mod tests {
         // Set target duration without video info - trim points won't be set yet
         clip.set_target_duration(ClipDuration::Seconds15);
         assert!(clip.has_target_duration());
-        assert_eq!(clip.duration_seconds, 15);
+        assert_eq!(clip.target_duration_seconds, 15);
         assert_eq!(clip.trim_end, 0.0); // No video info yet
         
         // When video info becomes available, trim points should be set for last X seconds
@@ -374,13 +374,13 @@ mod tests {
         
         // Initially no target duration and trim_end is 0
         assert!(!clip.has_target_duration());
-        assert_eq!(clip.duration_seconds, 0);
+        assert_eq!(clip.target_duration_seconds, 0);
         assert_eq!(clip.trim_end, 0.0);
         
         // Set target duration without video info should just set duration
         clip.set_target_duration(ClipDuration::Seconds30);
         assert!(clip.has_target_duration());
-        assert_eq!(clip.duration_seconds, 30);
+        assert_eq!(clip.target_duration_seconds, 30);
         // Without video info, trim points won't be set yet
         assert_eq!(clip.trim_end, 0.0);
         
@@ -393,7 +393,7 @@ mod tests {
         // Setting a different target duration should update trim points for last X seconds
         clip.set_target_duration(ClipDuration::Minutes1);
         assert!(clip.has_target_duration());
-        assert_eq!(clip.duration_seconds, 60);
+        assert_eq!(clip.target_duration_seconds, 60);
         assert_eq!(clip.trim_start, 60.0); // 120 - 60 = 60
         assert_eq!(clip.trim_end, 120.0);
     }
@@ -410,7 +410,7 @@ mod tests {
         // Set target duration before video info is loaded - trim points won't be set yet
         clip.set_target_duration(ClipDuration::Seconds30);
         assert!(clip.has_target_duration());
-        assert_eq!(clip.duration_seconds, 30);
+        assert_eq!(clip.target_duration_seconds, 30);
         assert_eq!(clip.trim_end, 0.0); // No video info yet
         
         // Simulate video info being loaded later
@@ -425,7 +425,7 @@ mod tests {
         
         // Target duration should still be preserved
         assert!(clip.has_target_duration());
-        assert_eq!(clip.duration_seconds, 30);
+        assert_eq!(clip.target_duration_seconds, 30);
     }
 
     #[test]

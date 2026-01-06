@@ -1,8 +1,9 @@
 use eframe::egui;
-use crate::core::{Clip, AppConfig, FileMonitor, NewReplayFile};
+use crate::core::{Clip, AppConfig, FileMonitor, NewReplayFile, clip::ClipDuration};
 use crate::video::{VideoPreview, WaveformData};
 use crate::hotkeys::{HotkeyManager, HotkeyEvent};
 use crate::gui::timeline::TimelineWidget;
+use crate::gui::clip_list_renderer::ClipListRenderer;
 use crate::audio::AudioConfirmation;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -67,6 +68,12 @@ pub struct ClipHelperApp {
     pub smart_thumbnail_cache: Option<Arc<crate::video::SmartThumbnailCache>>,
     /// New thread-safe media controller for in-UI playback
     pub media_controller: Option<Arc<std::sync::Mutex<crate::video::MediaController>>>,
+    /// Async video info loader for non-blocking video info loading
+    pub video_info_manager: crate::video::VideoInfoManager,
+    /// Hover thumbnail manager for clip list previews
+    pub hover_thumbnail_manager: crate::video::HoverThumbnailManager,
+    /// Currently hovered clip file to avoid spam calling hover methods
+    pub current_hover_target: Option<std::path::PathBuf>,
 }
 
 impl ClipHelperApp {
@@ -76,8 +83,26 @@ impl ClipHelperApp {
         visuals.override_text_color = Some(egui::Color32::WHITE);
         cc.egui_ctx.set_visuals(visuals);
         
-        let config = AppConfig::load()?;
-        config.ensure_directories()?;
+        let mut config = AppConfig::load()?;
+        
+        // Try to ensure directories - if it fails, the watched directory is unavailable
+        let (directory_available, unavailable_dir_message) = if let Some(ref dir) = config.last_watched_directory {
+            match config.ensure_directories() {
+                Ok(_) => (true, None),
+                Err(e) => {
+                    let msg = format!("Directory '{}' is unavailable: {}. Please select a new directory.", 
+                        dir.display(), e);
+                    log::warn!("Watched directory {} is unavailable: {}. Clearing from config.", dir.display(), e);
+                    // Clear the unavailable directory from config
+                    if let Err(save_err) = config.clear_last_watched_directory() {
+                        log::error!("Failed to save config after clearing unavailable directory: {}", save_err);
+                    }
+                    (false, Some(msg))
+                }
+            }
+        } else {
+            (true, None) // No directory to check
+        };
 
         // Set up hotkeys
         let (hotkey_manager, hotkey_receiver) = HotkeyManager::new(&config)?;
@@ -100,25 +125,30 @@ impl ClipHelperApp {
             }
         });
 
-        // Initialize file monitoring if we have a last watched directory
-        let (file_monitor, file_receiver, watched_directory) = if let Some(ref last_dir) = config.last_watched_directory {
-            if last_dir.exists() {
-                log::info!("Restoring last watched directory: {}", last_dir.display());
-                match FileMonitor::new(last_dir) {
-                    Ok((monitor, receiver)) => {
-                        log::info!("File monitoring initialized for {}", last_dir.display());
-                        (Some(monitor), Some(receiver), Some(last_dir.clone()))
+        // Initialize file monitoring if we have a last watched directory and it's available
+        let (file_monitor, file_receiver, watched_directory) = if directory_available {
+            if let Some(ref last_dir) = config.last_watched_directory {
+                if last_dir.exists() {
+                    log::info!("Restoring last watched directory: {}", last_dir.display());
+                    match FileMonitor::new(last_dir) {
+                        Ok((monitor, receiver)) => {
+                            log::info!("File monitoring initialized for {}", last_dir.display());
+                            (Some(monitor), Some(receiver), Some(last_dir.clone()))
+                        }
+                        Err(e) => {
+                            log::error!("Failed to initialize file monitoring for {}: {}", last_dir.display(), e);
+                            (None, None, None)
+                        }
                     }
-                    Err(e) => {
-                        log::error!("Failed to initialize file monitoring for {}: {}", last_dir.display(), e);
-                        (None, None, None)
-                    }
+                } else {
+                    log::warn!("Last watched directory no longer exists: {}", last_dir.display());
+                    (None, None, None)
                 }
             } else {
-                log::warn!("Last watched directory no longer exists: {}", last_dir.display());
                 (None, None, None)
             }
         } else {
+            log::info!("Starting with no watched directory (previous directory was unavailable)");
             (None, None, None)
         };
 
@@ -165,7 +195,7 @@ impl ClipHelperApp {
             watched_directory,
             show_directory_dialog: false,
             show_settings_dialog: false,
-            status_message: String::new(),
+            status_message: unavailable_dir_message.unwrap_or_default(),
             directory_browser_path: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\")),
             file_browser_path: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\")),
             show_sound_file_browser: false,
@@ -177,6 +207,9 @@ impl ClipHelperApp {
             audio_confirmation,
             smart_thumbnail_cache,
             media_controller: None,
+            video_info_manager: crate::video::VideoInfoManager::new(),
+            hover_thumbnail_manager: crate::video::HoverThumbnailManager::new(),
+            current_hover_target: None,
         };
 
         // Don't load saved clips here - we'll apply saved config after scanning files
@@ -211,22 +244,11 @@ impl ClipHelperApp {
             
             self.selected_clip_index = Some(index);
             
-            // Lazily load video info for the selected clip if not already loaded
-            if let Some(clip) = self.clips.get_mut(index) {
-                if clip.video_length_seconds.is_none() {
-                    log::debug!("Loading video info for selected clip: {}", clip.get_output_filename());
-                    match clip.populate_video_info() {
-                        Ok(is_valid) => {
-                            if is_valid {
-                                log::debug!("Video info loaded successfully for {}", clip.get_output_filename());
-                            } else {
-                                log::debug!("Video info loaded but file is still being written: {}", clip.get_output_filename());
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to get video info for {}: {}", clip.get_output_filename(), e);
-                        }
-                    }
+            // Request video info asynchronously if not already loaded or pending
+            if let Some(clip) = self.clips.get(index) {
+                if clip.video_length_seconds.is_none() && !self.video_info_manager.is_pending(&clip.original_file) {
+                    log::debug!("Requesting async video info for selected clip: {}", clip.get_output_filename());
+                    self.video_info_manager.request_if_needed(clip.original_file.clone());
                 }
             }
             
@@ -291,6 +313,17 @@ impl ClipHelperApp {
     }
 
     pub fn delete_selected_clip(&mut self) -> anyhow::Result<()> {
+        // Stop media controller first to release file handles
+        if let Some(_controller) = self.media_controller.take() {
+            log::debug!("Stopping media controller before delete");
+            // MediaController drops automatically and cleans up threads
+        }
+        
+        // Stop video preview if active
+        if let Some(mut preview) = self.video_preview.take() {
+            preview.stop();
+        }
+        
         if let Some(index) = self.selected_clip_index {
             if let Some(clip) = self.clips.get_mut(index) {
                 clip.is_deleted = true;
@@ -311,6 +344,9 @@ impl ClipHelperApp {
                 }
                 
                 log::info!("File successfully moved to deleted directory");
+                
+                // Clear selection since the clip is now deleted
+                self.selected_clip_index = None;
             }
         }
         Ok(())
@@ -472,11 +508,13 @@ impl ClipHelperApp {
         }
 
         // Always create clips without target duration - matching will happen at display time
-        let clip_result = Clip::new_without_target(file.path);
+        let clip_result = Clip::new_without_target(file.path.clone());
         
         match clip_result {
             Ok(clip) => {
-                // Don't block on video info - load it lazily when needed
+                // Request video info asynchronously (non-blocking)
+                self.video_info_manager.request_if_needed(file.path);
+                
                 log::info!("Created clip: {}", clip.get_output_filename());
                 self.clips.push(clip);
                 
@@ -637,57 +675,70 @@ impl ClipHelperApp {
     /// Ensures video info is loaded for a specific clip index
     /// Used for background loading when clips are displayed
     fn ensure_video_info_loaded(&mut self, clip_index: usize) {
-        if let Some(clip) = self.clips.get_mut(clip_index) {
-            if clip.needs_video_info_update() {
-                match clip.populate_video_info() {
-                    Ok(is_valid) => {
-                        if is_valid {
-                            log::debug!("Video info updated for {}", clip.get_output_filename());
-                        } else {
-                            log::debug!("Video info checked but file still being written: {}", clip.get_output_filename());
-                        }
-                    }
-                    Err(e) => {
-                        log::debug!("Failed to update video info for {}: {}", clip.get_output_filename(), e);
-                    }
-                }
+        if let Some(clip) = self.clips.get(clip_index) {
+            if clip.needs_video_info_update() && !self.video_info_manager.is_pending(&clip.original_file) {
+                log::debug!("Requesting async video info for clip {}: {}", clip_index, clip.get_output_filename());
+                self.video_info_manager.request_if_needed(clip.original_file.clone());
             }
         }
     }
 
-    /// Periodically updates video info for clips that need it
+    /// Periodically updates video info for clips that need it (fallback for files still being written)
     /// This ensures that clips being written by OBS get updated when they're finished
-    /// 
-    /// IMPORTANT: This method is called every frame from the main update loop to ensure
-    /// that grayed-out files (files still being written by OBS) get their video info
-    /// updated as soon as the file becomes valid. This provides a smooth user experience
-    /// where files automatically transition from grayed-out to selectable.
+    /// Periodically updates video info for clips that need it (fallback for files still being written)
+    /// This ensures that clips being written by OBS get updated when they're finished
     fn update_pending_video_info(&mut self) {
         let now = std::time::Instant::now();
         
-        // Check every 2 seconds to avoid excessive file system operations
+        // Check every 2 seconds to avoid excessive requests
         if now.duration_since(self.last_video_info_check).as_secs() >= 2 {
             self.last_video_info_check = now;
             
-            let mut updated_count = 0;
-            for clip in &mut self.clips {
-                if clip.needs_video_info_update() {
-                    match clip.populate_video_info() {
-                        Ok(is_valid) => {
-                            if is_valid {
-                                log::debug!("Video info updated for {}", clip.get_output_filename());
-                                updated_count += 1;
-                            }
-                        }
-                        Err(_) => {
-                            // File might not exist yet or still being written, ignore error
-                        }
-                    }
+            for clip in &self.clips {
+                if clip.needs_video_info_update() && !self.video_info_manager.is_pending(&clip.original_file) {
+                    self.video_info_manager.request_if_needed(clip.original_file.clone());
                 }
             }
-            
-            if updated_count > 0 {
-                log::info!("Updated video info for {} clips", updated_count);
+        }
+    }
+    
+    /// Process completed video info results from async loader
+    fn process_async_video_info_results(&mut self) {
+        let results = self.video_info_manager.process_completed();
+        
+        for result in results {
+            // Find the clip that matches this file path
+            if let Some(clip) = self.clips.iter_mut().find(|c| c.original_file == result.file_path) {
+                match result.result {
+                    Ok(video_info) => {
+                        // Update clip with video info
+                        clip.video_length_seconds = Some(video_info.duration);
+                        clip.audio_tracks = video_info.audio_tracks;
+                        
+                        // Thumbnails will be requested on-demand when clips are visible
+                        
+                        // Set trim points based on whether we have a target duration
+                        if clip.has_target_duration() {
+                            // Trim to last X seconds of the video
+                            let target_seconds = clip.target_duration_seconds as f64;
+                            clip.trim_start = (video_info.duration - target_seconds).max(0.0);
+                            clip.trim_end = video_info.duration;
+                        } else if clip.trim_end == 0.0 {
+                            // No target duration set, use full video length
+                            clip.trim_start = 0.0;
+                            clip.trim_end = video_info.duration;
+                        }
+                        
+                        log::debug!("Async video info loaded for {}: {:.2}s duration", 
+                            clip.get_output_filename(), video_info.duration);
+                    }
+                    Err(e) => {
+                        // Set invalid duration to indicate still being written
+                        clip.video_length_seconds = Some(0.0);
+                        log::debug!("Async video info failed for {}: {}", 
+                            clip.get_output_filename(), e);
+                    }
+                }
             }
         }
     }
@@ -776,9 +827,10 @@ impl ClipHelperApp {
                     Ok(existing_files) => {
                         log::info!("Found {} existing replay files, loading most recent 50", existing_files.len());
                         
-                        // Create clips from actual files
+                        // Create clips from actual files without eager loading
+                        // Video info will be loaded on-demand when clips scroll into view
                         for file in existing_files.into_iter().take(50) {
-                            match Clip::new_without_target(file.path) {
+                            match Clip::new_without_target(file.path.clone()) {
                                 Ok(clip) => {
                                     self.clips.push(clip);
                                 }
@@ -815,11 +867,11 @@ impl ClipHelperApp {
                                     // Match by original file path
                                     if current_clip.original_file == saved_clip.original_file {
                                         if saved_clip.has_target_duration() {
-                                            current_clip.duration_seconds = saved_clip.duration_seconds;
+                                            current_clip.target_duration_seconds = saved_clip.target_duration_seconds;
                                             current_clip.trim_start = saved_clip.trim_start;
                                             current_clip.trim_end = saved_clip.trim_end;
                                             log::debug!("Applied saved target duration {} to {}", 
-                                                saved_clip.duration_seconds, current_clip.get_output_filename());
+                                                saved_clip.target_duration_seconds, current_clip.get_output_filename());
                                         }
                                         current_clip.name = saved_clip.name.clone();
                                         current_clip.audio_tracks = saved_clip.audio_tracks.clone();
@@ -851,6 +903,12 @@ impl eframe::App for ClipHelperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Perform initial file scan if not done yet (non-blocking after UI is shown)
         self.perform_initial_scan();
+        
+        // Process completed video info results from async loader
+        self.process_async_video_info_results();
+        
+        // Process completed hover thumbnails
+        self.hover_thumbnail_manager.process_completed(ctx);
         
         // Initialize MediaController with video if needed
         self.initialize_media_controller_if_needed(ctx);
@@ -1050,7 +1108,7 @@ impl ClipHelperApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut clips_needing_info = Vec::new();
-                let mut clips_needing_duration_update = Vec::new();
+                let mut clips_needing_duration_update: Vec<(usize, ClipDuration, chrono::DateTime<chrono::Local>)> = Vec::new();
                 
                 if self.clips.is_empty() {
                     ui.label("No clips loaded");
@@ -1070,84 +1128,48 @@ impl ClipHelperApp {
                         ui.indent("session_clips", |ui| {
                             for &clip_index in &session.clips {
                                 if let Some(clip) = self.clips.get(clip_index) {
-                                    let is_selected = selected_index == Some(clip_index);
-                                    let is_valid = clip.is_video_valid();
+                                    // Skip deleted clips
+                                    if clip.is_deleted {
+                                        continue;
+                                    }
                                     
-                                    // Make the entire container clickable and take full width
-                                    let container_rect = egui::Rect::from_min_size(
-                                        ui.cursor().min,
-                                        egui::Vec2::new(ui.available_width(), 10.0 + ui.text_style_height(&egui::TextStyle::Body) * 3.0)
+                                    let is_selected = selected_index == Some(clip_index);
+                                    
+                                    // Use ClipListRenderer to render the clip
+                                    let result = ClipListRenderer::render_clip_item(
+                                        ui,
+                                        clip,
+                                        clip_index,
+                                        is_selected,
+                                        &mut self.hover_thumbnail_manager,
+                                        &self.current_hover_target,
                                     );
                                     
-                                    // Draw the container background FIRST (before content)
-                                    if is_selected {
-                                        ui.painter().rect_filled(container_rect, 4.0, ui.visuals().selection.bg_fill);
-                                    } else if container_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
-                                        // Use a more subtle hover background - lighter version of selection color
-                                        let mut hover_color = ui.visuals().selection.bg_fill;
-                                        hover_color[3] = (hover_color[3] as f32 * 0.3) as u8; // Make it 30% opacity
-                                        ui.painter().rect_filled(container_rect, 4.0, hover_color);
-                                    }
-                                    
-                                    // Draw border only for selected items
-                                    if is_selected {
-                                        ui.painter().rect_stroke(container_rect, 4.0, ui.visuals().selection.stroke);
-                                    }
-                                    
-                                    // Content area inside the container with 5px padding
-                                    let content_rect = container_rect.shrink(5.0);
-                                    
-                                    // Create the content inside the container
-                                    ui.allocate_ui_at_rect(content_rect, |ui| {
-                                        ui.scope(|ui| {
-                                            // Override text color for invalid files only
-                                            if !is_valid {
-                                                ui.visuals_mut().override_text_color = Some(egui::Color32::GRAY);
-                                            }
-                                            
-                                            // Filename
-                                            ui.label(&clip.get_output_filename());
-                                            
-                                            // Show video length and target duration on separate lines
-                                            if let Some(video_length) = clip.video_length_seconds {
-                                                if video_length >= 1.0 {
-                                                    ui.small(format!("Original: {}", Clip::format_duration(video_length)));
-                                                } else {
-                                                    ui.small("Waiting...");
-                                                }
-                                            } else {
-                                                ui.small("Waiting...");
-                                                // Mark for background loading
-                                                clips_needing_info.push(clip_index);
-                                            }
-                                            
-                                            // Show target duration - check for newer duration requests first
-                                            if let Some(matching_request) = self.find_matching_duration_request(clip) {
-                                                // Found a matching duration request - show it and mark for update if different
-                                                ui.small(format!("Target: {}", Clip::format_duration(matching_request.duration as u32 as f64)));
-                                                // Only update if the duration is different from current
-                                                if !clip.has_target_duration() || clip.duration_seconds != matching_request.duration as u32 {
-                                                    clips_needing_duration_update.push((clip_index, matching_request.duration, matching_request.timestamp));
-                                                }
-                                            } else if clip.has_target_duration() {
-                                                ui.small(format!("Target: {}", Clip::format_duration(clip.duration_seconds as f64)));
-                                            } else {
-                                                ui.small("Target: Not set");
-                                            }
-                                        });
-                                    });
-                                    
-                                    // Create an interactive layer over the entire container for clicks
-                                    let container_response = ui.interact(container_rect, egui::Id::new(format!("clip_container_{}", clip_index)), egui::Sense::click());
-                                    
-                                    if container_response.clicked() && is_valid {
+                                    // Handle results
+                                    if result.clicked {
                                         selected_index = Some(clip_index);
                                     }
                                     
-                                    // Advance cursor past the container (no double allocation)
-                                    ui.advance_cursor_after_rect(container_rect);
+                                    if let Some(file) = result.start_hover {
+                                        self.hover_thumbnail_manager.start_hover(&file);
+                                        self.current_hover_target = Some(file);
+                                    }
                                     
-                                    ui.add_space(4.0);
+                                    if result.stop_hover {
+                                        self.hover_thumbnail_manager.stop_hover();
+                                        self.current_hover_target = None;
+                                    }
+                                    
+                                    if result.needs_video_info {
+                                        clips_needing_info.push(clip_index);
+                                    }
+                                    
+                                    // Check for duration updates
+                                    if let Some(matching_request) = self.find_matching_duration_request(clip) {
+                                        if !clip.has_target_duration() || clip.target_duration_seconds != matching_request.duration as u32 {
+                                            clips_needing_duration_update.push((clip_index, matching_request.duration, matching_request.timestamp));
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -1215,8 +1237,10 @@ impl ClipHelperApp {
                     for file in existing_files.into_iter().take(20) {
                         // Create clips without target duration for existing files
                         let file_path = file.path.clone();
-                        match Clip::new_without_target(file.path) {
+                        match Clip::new_without_target(file.path.clone()) {
                             Ok(clip) => {
+                                // Request video info asynchronously (non-blocking)
+                                self.video_info_manager.request_if_needed(file_path.clone());
                                 log::debug!("Loaded existing file: {}", clip.get_output_filename());
                                 self.clips.push(clip);
                             }
@@ -1249,7 +1273,7 @@ impl ClipHelperApp {
                 
                 // Store clip info to avoid borrowing issues
                 let clip_name = clip.original_file.file_name().unwrap_or_default().to_string_lossy().to_string();
-                let duration = clip.duration_seconds;
+                let duration = clip.target_duration_seconds;
                 let trim_start = clip.trim_start;
                 let trim_end = clip.trim_end;
                 
@@ -1379,18 +1403,17 @@ impl ClipHelperApp {
                 // Check if we have media controller with current frame
                 if let Some(ref controller) = self.media_controller {
                     if let Ok(mut ctrl) = controller.lock() {
-                        // Only update player position if it's significantly different or for user interactions
-                        // This prevents constant FFmpeg restarts and maintains smooth playback
-                        let time_diff = (preview.current_time - ctrl.current_time()).abs();
-                        if time_diff > 0.1 {
-                            log::debug!("Significant time difference {:.2}s detected between preview ({:.1}s) and controller ({:.1}s) - NOT auto-seeking to prevent feedback loop", 
-                                time_diff, preview.current_time, ctrl.current_time());
-                            // DISABLED: ctrl.seek(preview.current_time); 
-                            // This was causing automatic seeks that created feedback loops
-                        }
-                        
                         // Update media controller for frame processing
                         ctrl.update(ui.ctx());
+                        
+                        // Sync preview position TO MediaController (MediaController is source of truth)
+                        let controller_time = ctrl.current_time();
+                        let time_diff = (preview.current_time - controller_time).abs();
+                        if time_diff > 0.1 {
+                            log::debug!("Syncing preview position from {:.2}s to controller position {:.2}s", 
+                                preview.current_time, controller_time);
+                            preview.sync_position(controller_time);
+                        }
                         
                         // Get current video frame as texture (currently returns None in mock mode)
                         if let Some(frame_texture) = ctrl.get_frame_texture(ui.ctx()) {
@@ -1506,36 +1529,30 @@ impl ClipHelperApp {
                 
                 // If user interacted with timeline, handle seeking appropriately
                 if timeline_response.clicked() {
-                    // Immediate seek for clicks
+                    // Only use MediaController for seeking - don't call preview.seek_to()
                     if let Some(ref controller) = self.media_controller {
-                        if let Some(preview) = &mut self.video_preview {
-                            log::debug!("Timeline click - forcing immediate seek to {:.2}s", preview.current_time);
+                        if let Some(preview) = &self.video_preview {
                             let seek_time = preview.current_time;
-                            controller.lock().unwrap().seek_immediate(seek_time);
-                            // Immediately update preview to prevent position jumping
-                            preview.seek_to(seek_time);
+                            log::debug!("Timeline click - seeking to {:.2}s", seek_time);
+                            controller.lock().unwrap().seek(seek_time);
                         }
                     }
                 } else if timeline_response.dragged() {
-                    // During drag, just show preview without restarting stream
+                    // During drag, use MediaController for seeking
                     if let Some(ref controller) = self.media_controller {
-                        if let Some(preview) = &mut self.video_preview {
+                        if let Some(preview) = &self.video_preview {
                             let seek_time = preview.current_time;
-                            // Use regular seek (no stream restart) during drag for smooth preview
+                            log::debug!("Timeline drag - seeking to {:.2}s", seek_time);
                             controller.lock().unwrap().seek(seek_time);
-                            // Keep preview in sync during drag
-                            preview.seek_to(seek_time);
                         }
                     }
                 } else if timeline_response.drag_stopped() {
-                    // When drag ends, do immediate seek to final position
+                    // When drag ends, final seek to position
                     if let Some(ref controller) = self.media_controller {
-                        if let Some(preview) = &mut self.video_preview {
-                            log::debug!("Timeline drag released - forcing immediate seek to {:.2}s", preview.current_time);
+                        if let Some(preview) = &self.video_preview {
                             let seek_time = preview.current_time;
-                            controller.lock().unwrap().seek_immediate(seek_time);
-                            // Immediately update preview to prevent position jumping
-                            preview.seek_to(seek_time);
+                            log::debug!("Timeline drag released - seeking to {:.2}s", seek_time);
+                            controller.lock().unwrap().seek(seek_time);
                         }
                     }
                 }
@@ -1686,12 +1703,14 @@ impl ClipHelperApp {
             }
             if ui.button("+1s").clicked() {
                 if let Some(clip) = self.get_selected_clip_mut() {
-                    clip.trim_end = (clip.trim_end + 1.0).min(clip.duration_seconds as f64);
+                    let max_duration = clip.video_length_seconds.unwrap_or(clip.trim_end);
+                    clip.trim_end = (clip.trim_end + 1.0).min(max_duration);
                 }
             }
             if ui.button("+5s").clicked() {
                 if let Some(clip) = self.get_selected_clip_mut() {
-                    clip.trim_end = (clip.trim_end + 5.0).min(clip.duration_seconds as f64);
+                    let max_duration = clip.video_length_seconds.unwrap_or(clip.trim_end);
+                    clip.trim_end = (clip.trim_end + 5.0).min(max_duration);
                 }
             }
         });
@@ -1951,18 +1970,18 @@ impl ClipHelperApp {
                 self.file_receiver = Some(receiver);
                 self.watched_directory = Some(path.clone());
                 
-                // Update config and save
+                // Update directory paths in config FIRST
+                self.config.obs_replay_directory = path.clone();
+                self.config.deleted_directory = path.join("deleted");
+                self.config.trimmed_directory = path.join("trimmed");
                 self.config.last_watched_directory = Some(path.clone());
+                
+                // Then save the config with all updated paths
                 if let Err(e) = self.config.save() {
                     log::error!("Failed to save config: {}", e);
                 } else {
                     log::info!("Config saved with new watched directory");
                 }
-                
-                // Update directory paths in config
-                self.config.obs_replay_directory = path.clone();
-                self.config.deleted_directory = path.join("deleted");
-                self.config.trimmed_directory = path.join("trimmed");
                 
                 // Ensure directories exist
                 if let Err(e) = self.config.ensure_directories() {

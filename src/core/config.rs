@@ -264,4 +264,10 @@ impl AppConfig {
         log::info!("All directories ensured successfully");
         Ok(())
     }
+    
+    /// Clear the last watched directory from config
+    pub fn clear_last_watched_directory(&mut self) -> anyhow::Result<()> {
+        self.last_watched_directory = None;
+        self.save()
+    }
 }
